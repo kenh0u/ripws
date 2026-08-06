@@ -1,0 +1,32 @@
+# Build artifacts
+/bin/
+/result
+/result-*
+
+# Nix
+/nix/
+
+# Go
+/*.test
+/*.out
+/coverage.txt
+
+# Credentials & runtime config (contains UUID→PSK map)
+/config/server.json
+/cfg/
+
+# Test artifacts
+/scripts/load-results.txt
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# IDE
+.vscode/
+.idea/
+*.iml

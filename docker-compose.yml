@@ -1,0 +1,41 @@
+services:
+  server:
+    build: .
+    image: ripws
+    container_name: ripws-server
+    networks: [ripws-net]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      ROLE: server
+      MODE: kernel
+      TUN_ADDR: 10.7.0.1/24
+      LISTEN: ":8080"
+      CONFIG: /cfg/server.json
+    volumes:
+      - ./config:/cfg:ro
+    # Keep the container running independently of the client.
+    restart: "no"
+
+  client:
+    build: .
+    image: ripws
+    container_name: ripws-client
+    networks: [ripws-net]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on: [server]
+    environment:
+      ROLE: client
+      MODE: kernel
+      TUN_ADDR: 10.7.0.2/24
+      URL: ws://server:8080/${RIPWS_UUID}
+      PSK: "${RIPWS_PSK}"
+      PING_INTERVAL: 30s
+    restart: "no"
+
+networks:
+  ripws-net:
+    driver: bridge
