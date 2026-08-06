@@ -2,7 +2,7 @@
 
 L3の生IPパケットをWebSocketバイナリフレームでトンネリングする、Tailscale風味の極小VPN実装。仕様は [`SPEC.md`](SPEC.md) を参照。
 
-- シングルバイナリ `up` / `down` / `gen-psk` / `gen-config` サブコマンド
+- シングルバイナリ `up` / `down` / `genkey` / `genuuid` サブコマンド
 - **wg-quick互換設定** — `ripws up ws0.conf` でTUN作成・アドレス割当・MTU・ルート・DNS・PreUp/PostUpフックを全自動設定
 - **Silent Drop** — 不正UUID・不正PSKは即座にTCP RST（`SO_LINGER=0`）、HTTPレスポンスなし
 - 2つのL3バックエンドを `tunnel.Interface` で統一:
@@ -21,14 +21,14 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
 - [サブコマンド概要](#サブコマンド概要)
 - [クイックスタート](#クイックスタート)
 - [設定ファイル形式](#設定ファイル形式)
-- [gen-psk](#gen-psk)
-- [gen-config](#gen-config)
+- [genkey](#genkey)
+- [genuuid](#genuuid)
 - [使用例](#使用例)
   - [1. カーネルモード（基本トンネル）](#1-カーネルモード基本トンネル)
   - [2. ユーザースペースモード（権限不要）](#2-ユーザースペースモード権限不要)
   - [3. ユーザースペース NATゲートウェイ](#3-ユーザースペース-natゲートウェイ)
   - [4. Cloudflare Tunnel経由 (wss://)](#4-cloudflare-tunnel経由-wss)
-  - [5. 複数クライアント（JSON設定ファイル）](#5-複数クライアントjson設定ファイル)
+  - [5. 複数クライアント（個別PSK）](#5-複数クライアント個別psk)
 - [テストスクリプト](#テストスクリプト)
 - [Dockerテスト](#dockerテスト)
 - [プロジェクトレイアウト](#プロジェクトレイアウト)
@@ -63,9 +63,9 @@ CGO_ENABLED=0 go build -o ripws .
 ```
 ripws up   <config.conf>  トンネルを起動（TUN/netstack作成・アドレス・MTU・ルート・DNS・フック全自動）
 ripws down <iface|conf>   実行中のトンネルを停止（SIGTERM + クリーンアップ）
-ripws gen-psk              新規32バイトBase64 PSKを生成
-ripws gen-config           新規UUIDに新規PSKを割り当てたJSONを生成
-ripws help                 ヘルプを表示
+ripws genkey              新規32バイトBase64 PSKを生成（WireGuard風命名）
+ripws genuuid             新規UUIDv4を生成（クライアント識別子）
+ripws help                ヘルプを表示
 ```
 
 ---
@@ -76,9 +76,8 @@ ripws help                 ヘルプを表示
 
 ```sh
 # 認証情報生成
-ripws gen-config > /tmp/creds.json
-UUID="$(jq -r 'keys[0]' /tmp/creds.json)"
-PSK="$(jq -r ".[\"$UUID\"]" /tmp/creds.json)"
+UUID="$(ripws genuuid)"
+PSK="$(ripws genkey)"
 
 # --- サーバー設定 (/etc/ripws/ws0.conf) ---
 cat > /tmp/ws0.conf << EOF
@@ -180,27 +179,24 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 
 ---
 
-## gen-psk
+## genkey
 
-PSK（Pre-Shared Key）を生成。32バイトの乱数をBase64エンコードした44文字の文字列を出力。
+PSK（Pre-Shared Key）を生成。32バイトの乱数をBase64エンコードした44文字の文字列を出力。WireGuard風の命名（`wg genkey` → `ripws genkey`）。
 
 ```sh
-ripws gen-psk
+ripws genkey
 # 出力例: 8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk=
 ```
 
 ---
 
-## gen-config
+## genuuid
 
-UUIDv4を新規生成し、それに対応する新規PSKを割り当てたJSONを出力。サーバー設定ファイルの雛形として使用。
+UUIDv4を新規生成。WebSocketのURLパスおよび `[Peer]` の `PublicKey` に使用するクライアント識別子。
 
 ```sh
-ripws gen-config
-# 出力例:
-# {
-#   "f47ac10b-58cc-4372-a567-0e02b2c3d479": "8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk="
-# }
+ripws genuuid
+# 出力例: f47ac10b-58cc-4372-a567-0e02b2c3d479
 ```
 
 ---
@@ -213,9 +209,8 @@ ripws gen-config
 
 ```sh
 # 認証情報生成
-ripws gen-config > creds.json
-UUID="$(jq -r 'keys[0]' creds.json)"
-PSK="$(jq -r ".[\"$UUID\"]" creds.json)"
+UUID="$(ripws genuuid)"
+PSK="$(ripws genkey)"
 
 # --- サーバー設定 (/etc/ripws/ws0.conf) ---
 cat > /etc/ripws/ws0.conf << EOF
@@ -387,18 +382,14 @@ iperf3 -c 10.7.0.1 -p 5201 -t 15 -u -b 500M  # UDP 500Mbps
 
 ---
 
-### 5. 複数クライアント（JSON設定ファイル）
+### 5. 複数クライアント（個別PSK）
 
 サーバーの `PrivateKey`（PSK）が全peerのデフォルト。peer個別の `PresharedKey` で異なるPSKを指定可能。
 
 ```sh
 # 複数のUUID-PSKペアを生成
-ripws gen-config > creds.json
-# creds.json に手動でエントリを追加:
-# {
-#   "uuid-a": "psk-a",
-#   "uuid-b": "psk-b"
-# }
+UUID_A="$(ripws genuuid)"; PSK_A="$(ripws genkey)"
+UUID_B="$(ripws genuuid)"; PSK_B="$(ripws genkey)"
 
 # 複数peerを持つサーバー設定
 cat > /etc/ripws/ws0.conf << EOF
@@ -409,21 +400,21 @@ PrivateKey = $DEFAULT_PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = uuid-a
-PresharedKey = psk-a
+PublicKey  = $UUID_A
+PresharedKey = $PSK_A
 AllowedIPs = 10.7.0.2/32
 
 [Peer]
-PublicKey  = uuid-b
-PresharedKey = psk-b
+PublicKey  = $UUID_B
+PresharedKey = $PSK_B
 AllowedIPs = 10.7.0.3/32
 EOF
 
 sudo ripws up ws0.conf
 
 # 各クライアントは自身のUUID/PSKで接続
-# クライアントA: Endpoint = ws://SERVER:8080/uuid-a, PrivateKey = psk-a
-# クライアントB: Endpoint = ws://SERVER:8080/uuid-b, PrivateKey = psk-b
+# クライアントA: Endpoint = ws://SERVER:8080/$UUID_A, PrivateKey = $PSK_A
+# クライアントB: Endpoint = ws://SERVER:8080/$UUID_B, PrivateKey = $PSK_B
 ```
 
 ---
@@ -476,10 +467,9 @@ mkdir -p bin && cp -L result/bin/ripws bin/ripws
 sudo docker compose build
 
 # 認証情報生成
-CRED="$(nix run .#ripws -- gen-config)"
-UUID="$(printf '%s' "$CRED" | jq -r 'keys[0]')"
-PSK="$(printf '%s' "$CRED" | jq -r ".[\"$UUID\"]")"
-mkdir -p config && printf '%s\n' "$CRED" > config/server.json
+UUID="$(nix run .#ripws -- genuuid)"
+PSK="$(nix run .#ripws -- genkey)"
+mkdir -p config && printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
 
 export RIPWS_UUID="$UUID" RIPWS_PSK="$PSK"
 sudo -E docker compose up -d server client
@@ -499,10 +489,10 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## プロジェクトレイアウト
 
 ```
-main.go                      up/down/gen-psk/gen-config ディスパッチ
+main.go                      up/down/genkey/genuuid ディスパッチ
 flake.nix                    buildGoModule（静的バイナリ）
 internal/
-  config/                    JSON + flag認証情報、PSKバリデーション (SPEC 2.2)
+  config/                    認証情報、PSKバリデーション (SPEC 2.2)
     quickconf.go             wg-quick互換INIパーサー（Mode, NATフィールド対応）
   proto/                     IPバージョンニブル、キープアライブ、指数バックオフ
   tunnel/
@@ -538,7 +528,7 @@ Dockerfile, docker-compose*.yml
 | L3接続性（カーネルモード） | PASS |
 | Silent Drop セキュリティ | PASS |
 | Userspace NATゲートウェイ | PASS（TCP/UDP/DNS, tunnel → internet） |
-| iperf3スループット（kernel） | PASS（1.64 Gbps -P64） |
+| iperf3スループット（kernel） | PASS（1.77 Gbps -P64） |
 | マルチポート同時接続 | PASS（32/32） |
 | 再接続・KeepAlive | PASS |
 | レース検出器・ユニットテスト | PASS |

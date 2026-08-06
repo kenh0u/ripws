@@ -1,9 +1,9 @@
 # RIPWS Test Report
 
-**Date:** 2026-08-06  
+**Date:** 2026-08-07  
 **Build:** ripws 0.1.0 (Nix `buildGoModule`, Go 1.26.5, CGO disabled)  
 **Platform:** NixOS, Linux x86_64, Docker 29.6  
-**CLI:** `ripws up <config.conf>` / `ripws down <iface>` / `ripws gen-psk` / `ripws gen-config`
+**CLI:** `ripws up <config.conf>` / `ripws down <iface>` / `ripws genkey` / `ripws genuuid`
 
 ---
 
@@ -13,8 +13,8 @@
 
 | Direction | Packets | Loss | RTT (min/avg/max) |
 |-----------|---------|------|--------------------|
-| Client → Server | 4/4 | 0% | 0.458 / 0.577 / 0.829 ms |
-| Server → Client | 4/4 | 0% | 0.195 / 0.402 / 0.650 ms |
+| Client → Server | 4/4 | 0% | 0.157 / 0.306 / 0.665 ms |
+| Server → Client | 4/4 | 0% | 0.297 / 0.333 / 0.368 ms |
 
 **Verdict:** PASS — bidirectional L3 tunnel fully functional.
 
@@ -48,18 +48,18 @@ The client runs in userspace mode (`Mode = userspace`, `NAT = true` in INI confi
 
 | Test | Protocol | Result |
 |------|----------|--------|
-| `curl http://1.1.1.1/` | TCP 80 | HTTP 301, 0.026s, 167 bytes |
-| `curl https://1.1.1.1/` | TCP 443 (TLS) | HTTP 301, 0.058s |
+| `curl http://1.1.1.1/` | TCP 80 | HTTP 301, 0.024s, 167 bytes |
+| `curl https://1.1.1.1/` | TCP 443 (TLS) | HTTP 301, 0.050s |
 | `dig @8.8.8.8 example.com` | UDP 53 | Resolved: 104.20.23.154, 172.66.147.243 |
 
 **NAT log sample (client):**
 ```
 nat: userspace NAT enabled (TCP+UDP forwarder installed)
-nat: tcp 10.7.0.1:55638 -> 1.1.1.1:80
+nat: tcp 10.7.0.1:57120 -> 1.1.1.1:80
 nat: tcp 1.1.1.1:80 closed
-nat: tcp 10.7.0.1:33562 -> 1.1.1.1:443
+nat: tcp 10.7.0.1:38574 -> 1.1.1.1:443
 nat: tcp 1.1.1.1:443 closed
-nat: udp 10.7.0.1:59537 -> 8.8.8.8:53
+nat: udp 10.7.0.1:57237 -> 8.8.8.8:53
 ```
 
 **Verdict:** PASS — server→tunnel→client(userspace NAT)→internet works for TCP, UDP, and DNS. The client acts as a transparent NAT gateway without any kernel privileges.
@@ -70,7 +70,7 @@ nat: udp 10.7.0.1:59537 -> 8.8.8.8:53
 
 | Test | Direction | Bitrate | Notes |
 |------|-----------|---------|-------|
-| TCP -P 64 (64 parallel) | client → server | **1.64 Gbps** sender / **1.63 Gbps** receiver | 61,167 total retransmits / 10s |
+| TCP -P 64 (64 parallel) | client → server | **1.77 Gbps** sender / **1.76 Gbps** receiver | 64,330 total retransmits / 10s |
 
 **Verdict:** PASS — multi-Gbps throughput.
 
@@ -83,7 +83,7 @@ nat: udp 10.7.0.1:59537 -> 8.8.8.8:53
 | Concurrent connections | 32 |
 | Distinct ports | 32 (5201–5232) |
 | Success rate | **32/32 (100%)** |
-| Per-stream bitrate (sample) | ~63 Mbps |
+| Per-stream bitrate (sample) | ~40–70 Mbps |
 
 **Verdict:** PASS — all 32 simultaneous connections established and completed successfully.
 
@@ -143,7 +143,7 @@ ok  	ripws/internal/proto	(cached)
 | L3 connectivity (kernel mode) | PASS |
 | Silent Drop security | PASS |
 | Userspace NAT gateway | PASS (TCP/UDP/DNS via tunnel → internet) |
-| Throughput (iperf3, kernel) | PASS (1.64 Gbps -P64) |
+| Throughput (iperf3, kernel) | PASS (1.77 Gbps -P64) |
 | Multi-port concurrency | PASS (32/32) |
 | Reconnection & KeepAlive | PASS |
 | Race detector & unit tests | PASS |

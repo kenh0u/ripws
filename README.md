@@ -5,7 +5,7 @@
 A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 [`SPEC.md`](SPEC.md)): raw L3 packets tunneled over a WebSocket binary stream.
 
-- Single binary with `up` / `down` / `gen-psk` / `gen-config` subcommands.
+- Single binary with `up` / `down` / `genkey` / `genuuid` subcommands.
 - **wg-quick-compatible configuration** — `ripws up ws0.conf` automatically creates the TUN device, assigns addresses, configures MTU, routes, DNS, and runs PreUp/PostUp hooks.
 - **Silent Drop** — unknown UUID or bad PSK ⇒ immediate TCP RST
   (`SO_LINGER=0`), no HTTP response.
@@ -31,8 +31,8 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 - [Subcommand Overview](#subcommand-overview)
 - [Quick Start](#quick-start)
 - [Config File Format](#config-file-format)
-- [gen-psk](#gen-psk)
-- [gen-config](#gen-config)
+- [genkey](#genkey)
+- [genuuid](#genuuid)
 - [Usage Examples](#usage-examples)
   - [1. Kernel Mode (Basic Tunnel)](#1-kernel-mode-basic-tunnel)
   - [2. Userspace Mode (No Privileges)](#2-userspace-mode-no-privileges)
@@ -75,8 +75,8 @@ CGO_ENABLED=0 go build -o ripws .
 ```
 ripws up   <config.conf>  Bring up a tunnel (TUN/netstack creation, addr, MTU, routes, DNS, hooks)
 ripws down <iface|conf>   Tear down a running tunnel (SIGTERM + cleanup)
-ripws gen-psk             Generate a fresh 32-byte Base64 PSK
-ripws gen-config          Generate JSON mapping a fresh UUID to a fresh PSK
+ripws genkey             Generate a fresh 32-byte Base64 PSK (WireGuard-style)
+ripws genuuid            Generate a fresh UUIDv4 (client identity)
 ripws help                Show help
 ```
 
@@ -90,9 +90,8 @@ injection, and PreUp/PostUp hooks.
 
 ```sh
 # Generate credentials
-ripws gen-config > /tmp/creds.json
-UUID="$(jq -r 'keys[0]' /tmp/creds.json)"
-PSK="$(jq -r ".[\"$UUID\"]" /tmp/creds.json)"
+UUID="$(ripws genuuid)"
+PSK="$(ripws genkey)"
 
 # --- Server config (/etc/ripws/ws0.conf) ---
 cat > /tmp/ws0.conf << EOF
@@ -195,29 +194,26 @@ The interface name is derived from the config file's basename minus `.conf`:
 
 ---
 
-## gen-psk
+## genkey
 
 Generates a Pre-Shared Key: 32 random bytes Base64-encoded into a 44-character
-string.
+string. WireGuard-style naming (`wg genkey` → `ripws genkey`).
 
 ```sh
-ripws gen-psk
+ripws genkey
 # Example output: 8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk=
 ```
 
 ---
 
-## gen-config
+## genuuid
 
-Generates a fresh UUIDv4 and a corresponding PSK, output as JSON. Use as a
-template for the server config file.
+Generates a fresh UUIDv4 — the client identity used as the WebSocket URL path
+and the `PublicKey` in `[Peer]` sections.
 
 ```sh
-ripws gen-config
-# Example output:
-# {
-#   "f47ac10b-58cc-4372-a567-0e02b2c3d479": "8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk="
-# }
+ripws genuuid
+# Example output: f47ac10b-58cc-4372-a567-0e02b2c3d479
 ```
 
 ---
@@ -231,9 +227,8 @@ The most basic configuration. Both server and client use TUN devices. Requires
 
 ```sh
 # Generate credentials
-ripws gen-config > creds.json
-UUID="$(jq -r 'keys[0]' creds.json)"
-PSK="$(jq -r ".[\"$UUID\"]" creds.json)"
+UUID="$(ripws genuuid)"
+PSK="$(ripws genkey)"
 
 # --- Server config (/etc/ripws/ws0.conf) ---
 cat > /etc/ripws/ws0.conf << EOF
@@ -421,12 +416,8 @@ The server's `PrivateKey` (PSK) is the default for all peers. Per-peer
 
 ```sh
 # Generate multiple UUID-PSK pairs
-ripws gen-config > creds.json
-# Manually add entries:
-# {
-#   "uuid-a": "psk-a",
-#   "uuid-b": "psk-b"
-# }
+UUID_A="$(ripws genuuid)"; PSK_A="$(ripws genkey)"
+UUID_B="$(ripws genuuid)"; PSK_B="$(ripws genkey)"
 
 # Server config with multiple peers
 cat > /etc/ripws/ws0.conf << EOF
@@ -437,21 +428,21 @@ PrivateKey = $DEFAULT_PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = uuid-a
-PresharedKey = psk-a
+PublicKey  = $UUID_A
+PresharedKey = $PSK_A
 AllowedIPs = 10.7.0.2/32
 
 [Peer]
-PublicKey  = uuid-b
-PresharedKey = psk-b
+PublicKey  = $UUID_B
+PresharedKey = $PSK_B
 AllowedIPs = 10.7.0.3/32
 EOF
 
 sudo ripws up ws0.conf
 
 # Each client connects with its own UUID/PSK
-# Client A: Endpoint = ws://SERVER:8080/uuid-a, PrivateKey = psk-a
-# Client B: Endpoint = ws://SERVER:8080/uuid-b, PrivateKey = psk-b
+# Client A: Endpoint = ws://SERVER:8080/$UUID_A, PrivateKey = $PSK_A
+# Client B: Endpoint = ws://SERVER:8080/$UUID_B, PrivateKey = $PSK_B
 ```
 
 ---
@@ -508,10 +499,9 @@ mkdir -p bin && cp -L result/bin/ripws bin/ripws
 sudo docker compose build
 
 # Generate credentials
-CRED="$(nix run .#ripws -- gen-config)"
-UUID="$(printf '%s' "$CRED" | jq -r 'keys[0]')"
-PSK="$(printf '%s' "$CRED" | jq -r ".[\"$UUID\"]")"
-mkdir -p config && printf '%s\n' "$CRED" > config/server.json
+UUID="$(nix run .#ripws -- genuuid)"
+PSK="$(nix run .#ripws -- genkey)"
+mkdir -p config && printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
 
 export RIPWS_UUID="$UUID" RIPWS_PSK="$PSK"
 sudo -E docker compose up -d server client
@@ -531,10 +521,10 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## Project Layout
 
 ```
-main.go                      up/down/gen-psk/gen-config dispatch
+main.go                      up/down/genkey/genuuid dispatch
 flake.nix                    buildGoModule (static binary)
 internal/
-  config/                    JSON + flag credentials, PSK validation (SPEC 2.2)
+  config/                    credentials, PSK validation (SPEC 2.2)
     quickconf.go             wg-quick-compatible INI parser (Mode, NAT fields)
   proto/                     IP-version nibble, keep-alive, exponential backoff
   tunnel/
@@ -571,7 +561,7 @@ See [`REPORT.md`](REPORT.md) for full test results.
 | L3 connectivity (kernel mode) | PASS |
 | Silent Drop security | PASS |
 | Userspace NAT gateway | PASS (TCP/UDP/DNS, tunnel → internet) |
-| iperf3 throughput (kernel) | PASS (1.64 Gbps -P64) |
+| iperf3 throughput (kernel) | PASS (1.77 Gbps -P64) |
 | Multi-port concurrency | PASS (32/32) |
 | Reconnection & KeepAlive | PASS |
 | Race detector & unit tests | PASS |
