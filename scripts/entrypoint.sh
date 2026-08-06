@@ -1,126 +1,108 @@
 #!/bin/sh
 # Container entrypoint for the RIPWS test images.
 #
-# It starts the ripws binary in the background, waits for the kernel TUN device
-# to appear, configures its address / routes, then waits for the ripws process
-# to exit. Environment variables:
+# Generates a wg-quick-style INI config from environment variables and runs
+# `ripws up` on it. On SIGTERM/SIGINT the process exits and the tunnel is
+# cleaned up.
 #
+# Environment variables:
 #   ROLE         server | client
-#   TUN_ADDR     CIDR assigned to the TUN (e.g. 10.7.0.1/24)
-#   TUN_NAME     expected TUN device name (default tun0)
-#   LISTEN       server: listen address (default :8080)
-#   CONFIG       server: path to JSON credentials (default /cfg/server.json)
-#   UUID         server: single-client UUID (optional, with PSK)
-#   PSK          server: single-client PSK; client: the PSK to present
-#   URL          client: ws(s)://host:port/<uuid>
 #   MODE         kernel | userspace (default kernel)
-#   US_ADDR      userspace: virtual IP(s)
-#   US_ROUTE     userspace: routes
-#   US_ECHO      server userspace: echo listener address
-#   US_DIAL      client userspace: probe target
-#   US_PING      client userspace: ICMP ping target IP
-#   US_PING_COUNT client userspace: ping count (default 4)
-#   US_FORWARD   client userspace: TCP forward spec LOCAL=REMOTE
-#   US_UDP_FORWARD client userspace: UDP forward spec LOCAL=REMOTE
-#   US_NAT       client userspace: enable NAT gateway (1/0)
-#   NAT_ROUTES   server: comma-separated CIDRs to route via client tunnel IP
-#   IPERF3       server: start iperf3 -s bound to this address (e.g. 10.8.0.1)
-#   PING_INTERVAL client: ws ping interval (default 60s)
+#   TUN_ADDR     CIDR assigned to the interface (e.g. 10.7.0.1/24)
+#   LISTEN       server: listen port (default 8080)
+#   PSK          pre-shared key (base64, 44 chars)
+#   UUID         peer UUID (also used as URL path component on client)
+#   URL          client: ws(s)://host:port/<uuid> endpoint
+#   PING_INTERVAL client: WebSocket Ping interval in seconds (default 60)
+#   NAT          userspace: enable NAT gateway (1/0)
+#   NAT_ROUTES   server kernel: comma-separated CIDRs to route via tunnel
+#   IPERF3       server: start iperf3 -s bound to this address
 
 set -eu
 
-TUN_NAME="${TUN_NAME:-tun0}"
 MODE="${MODE:-kernel}"
+PING_INTERVAL="${PING_INTERVAL:-60}"
+CONF_DIR="/tmp/ripws"
+CONF_FILE="$CONF_DIR/ws0.conf"
 
 log() { printf '[entrypoint] %s\n' "$*"; }
 
-# water creates a TUN whose name is chosen by the kernel (tun0, tun1, ...).
-# We discover the first tun* device that appears after startup.
-wait_for_tun() {
-    for _ in $(seq 1 100); do
-        for cand in /sys/class/net/tun*; do
-            [ -e "$cand" ] || continue
-            echo "${cand##*/}"
-            return 0
-        done
-        sleep 0.1
-    done
-    return 1
+mkdir -p "$CONF_DIR"
+
+# Derive the peer's tunnel IP from TUN_ADDR by replacing the last octet with .2
+peer_ip() {
+    echo "${1:-10.7.0.1/24}" | cut -d/ -f1 | sed 's/\.[0-9]*$/.2/'
 }
 
-configure_tun() {
-    dev="$1"
-    log "configuring $dev with $TUN_ADDR"
-    ip addr add "$TUN_ADDR" dev "$dev"
-    ip link set up dev "$dev"
-    # Enable forwarding on the server side (harmless on client).
-    if [ "$ROLE" = "server" ]; then
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+# Derive the subnet from TUN_ADDR (e.g. 10.7.0.1/24 -> 10.7.0.0/24)
+subnet() {
+    ip_part=$(echo "${1:-10.7.0.1/24}" | cut -d/ -f1)
+    mask=$(echo "${1:-10.7.0.1/24}" | cut -d/ -f2)
+    octets=$(echo "$ip_part" | tr '.' ' ')
+    set -- $octets
+    if [ "$mask" = "24" ]; then
+        echo "$1.$2.$3.0/$mask"
+    elif [ "$mask" = "16" ]; then
+        echo "$1.$2.0.0/$mask"
+    else
+        echo "$1.$2.$3.0/$mask"
     fi
 }
 
-start_ripws() {
-    case "$ROLE" in
-        server)
-            args="server --listen ${LISTEN:-:8080} --mode $MODE"
-            if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
-                args="$args --config $CONFIG"
+# --- Build INI config from environment ---
+build_config() {
+    local_addr="${TUN_ADDR:-10.7.0.1/24}"
+    tun_subnet=$(subnet "$local_addr")
+    log "building config: $CONF_FILE (role=$ROLE mode=$MODE addr=$local_addr)"
+
+    {
+        echo "[Interface]"
+        echo "Address = $local_addr"
+        if [ "$ROLE" = "server" ]; then
+            echo "ListenPort = ${LISTEN:-8080}"
+        fi
+        echo "PrivateKey = $PSK"
+        echo "Mode = $MODE"
+        if [ "${NAT:-0}" = "1" ]; then
+            echo "NAT = true"
+        fi
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = ${UUID}"
+        if [ "$ROLE" = "server" ]; then
+            # Server: allow the client's /32 plus any NAT target CIDRs.
+            client_ip=$(peer_ip "$local_addr")
+            allowed="${client_ip}/32"
+            if [ -n "${NAT_ROUTES:-}" ]; then
+                allowed="${allowed},${NAT_ROUTES}"
             fi
-            if [ -n "${UUID:-}" ] && [ -n "${PSK:-}" ]; then
-                args="$args --uuid $UUID --psk $PSK"
-            fi
-            if [ -n "${US_ADDR:-}" ]; then args="$args --us-addr $US_ADDR"; fi
-            if [ -n "${US_ROUTE:-}" ]; then args="$args --us-route $US_ROUTE"; fi
-            if [ -n "${US_ECHO:-}" ]; then args="$args --us-echo $US_ECHO"; fi
-            ;;
-        client)
-            args="client --url $URL --psk $PSK --mode $MODE"
-            if [ -n "${US_ADDR:-}" ]; then args="$args --us-addr $US_ADDR"; fi
-            if [ -n "${US_ROUTE:-}" ]; then args="$args --us-route $US_ROUTE"; fi
-            if [ -n "${US_DIAL:-}" ]; then args="$args --us-dial $US_DIAL"; fi
-            if [ -n "${US_PING:-}" ]; then args="$args --us-ping $US_PING"; fi
-            if [ -n "${US_PING_COUNT:-}" ]; then args="$args --us-ping-count $US_PING_COUNT"; fi
-            if [ -n "${US_FORWARD:-}" ]; then args="$args --us-forward $US_FORWARD"; fi
-            if [ -n "${US_UDP_FORWARD:-}" ]; then args="$args --us-udp-forward $US_UDP_FORWARD"; fi
-            if [ "${US_NAT:-}" = "1" ]; then args="$args --us-nat"; fi
-            args="$args --ping-interval ${PING_INTERVAL:-60s}"
-            ;;
-        *)
-            log "unknown ROLE=$ROLE"; exit 2;;
-    esac
-    log "starting: ripws $args"
-    ripws $args &
-    RIPWS_PID=$!
+            echo "AllowedIPs = $allowed"
+        else
+            echo "Endpoint = ${URL}"
+            # Client: only route the tunnel subnet via the TUN (avoid stealing
+            # the container's default route which would break the WebSocket).
+            echo "AllowedIPs = $tun_subnet"
+            echo "PersistentKeepalive = ${PING_INTERVAL}"
+        fi
+    } > "$CONF_FILE"
 }
 
-start_ripws
+build_config
 
-if [ "$MODE" = "kernel" ]; then
-    dev="$(wait_for_tun)" || { log "TUN did not appear"; exit 1; }
-    log "TUN device up: $dev"
-    configure_tun "$dev"
-fi
+log "starting: ripws up $CONF_FILE"
+ripws up "$CONF_FILE" &
+RIPWS_PID=$!
 
-# Optional iperf3 server (server side, after TUN is configured).
+# Optional iperf3 server (server side, after tunnel is up).
 if [ "$ROLE" = "server" ] && [ -n "${IPERF3:-}" ]; then
+    # Wait briefly for the TUN to come up so iperf3 can bind.
+    sleep 2
     log "starting iperf3 -s -B $IPERF3"
     iperf3 -s -B "$IPERF3" -D 2>/dev/null || true
-    sleep 1
     log "iperf3 server started"
 fi
 
-# Optional server-side routes via client tunnel IP (for NAT testing).
-if [ "$ROLE" = "server" ] && [ "$MODE" = "kernel" ] && [ -n "${NAT_ROUTES:-}" ]; then
-    CLIENT_IP="${NAT_CLIENT_IP:-10.7.0.2}"
-    IFS=','
-    for cidr in $NAT_ROUTES; do
-        log "adding route: $cidr via $CLIENT_IP"
-        ip route add "$cidr" via "$CLIENT_IP" dev "$TUN_NAME" 2>/dev/null || true
-    done
-    unset IFS
-fi
-
-# Wait for the ripws process to exit, then propagate its status.
+# Wait for ripws to exit and propagate its status.
 wait "$RIPWS_PID"
 status=$?
 log "ripws exited with status $status"

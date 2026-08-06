@@ -5,7 +5,6 @@ package tunnel
 
 import (
 	"fmt"
-	"os"
 	"sync"
 
 	"github.com/songgao/water"
@@ -67,6 +66,3 @@ func (t *tunKernel) Close() error {
 
 // compile-time assertion that tunKernel satisfies Interface.
 var _ Interface = (*tunKernel)(nil)
-
-// errUnused keeps os import in case future helpers need file ops.
-var _ = os.O_RDONLY

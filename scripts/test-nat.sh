@@ -2,10 +2,10 @@
 # NAT test: server(kernel) -> tunnel -> client(userspace NAT) -> internet
 #
 # Topology:
-#   ripws-server (tun0 10.7.0.1/24)
-#       |  route 1.1.1.1/32, 8.8.8.8/32 via 10.7.0.2
+#   ripws-server (ws0 10.7.0.1/24)
+#       |  route 1.1.1.1/32, 8.8.8.8/32 via tunnel (AllowedIPs)
 #       |  WebSocket ws://server:8080/<uuid>
-#   ripws-client (userspace netstack 10.7.0.2, --us-nat)
+#   ripws-client (userspace netstack 10.7.0.2, NAT enabled)
 #       |  net.Dial to external IPs via Docker bridge (internet access)
 #   internet (1.1.1.1, 8.8.8.8)
 #
@@ -13,10 +13,6 @@
 #   1. TCP: curl http://1.1.1.1 from server (through tunnel → client NAT → internet)
 #   2. TCP: curl https://1.1.1.1 (TLS)
 #   3. UDP: dig @8.8.8.8 example.com from server
-#   4. TCP: curl http://httpbin.org (if DNS resolves)
-#
-# The client container has internet access via Docker's default NAT.
-# The server routes specific external IPs via the client's tunnel IP.
 
 DC="sudo -E docker compose -f docker-compose.nat.yml"
 
@@ -79,18 +75,13 @@ sudo docker exec ripws-server curl -sS --max-time 10 -o /dev/null -w "HTTP %{htt
 
 # 7. UDP test: DNS query to 8.8.8.8
 say "UDP test: dig @8.8.8.8 example.com from server"
-sudo docker exec ripws-server sh -c "apt-get install -y -qq dnsutils >/dev/null 2>&1 || true; dig @8.8.8.8 example.com +short +time=5 2>&1" || echo "dig not available, trying nslookup"
-sudo docker exec ripws-server sh -c "nslookup example.com 8.8.8.8 2>&1 || true" || true
+sudo docker exec ripws-server sh -c "dig @8.8.8.8 example.com +short +time=5 2>&1" || echo "dig not available"
 
-# 8. TCP test: curl to a domain (tests DNS + TCP)
-say "TCP test: curl http://example.com from server (DNS + TCP via tunnel)"
-sudo docker exec ripws-server sh -c "apt-get install -y -qq dnsutils >/dev/null 2>&1; curl -sS --max-time 10 -o /dev/null -w 'HTTP %{http_code}, %{time_total}s\n' http://example.com/ 2>&1" || echo "FAILED (DNS may not route through tunnel)"
-
-# 9. Show NAT logs
+# 8. Show NAT logs
 say "NAT activity logs (client)"
 sudo docker logs ripws-client 2>&1 | grep "nat:" | tail -20 || true
 
-# 10. Cleanup
+# 9. Cleanup
 say "Done — leaving containers running for inspection"
 echo "  sudo docker logs ripws-client"
 echo "  ${DC} down"

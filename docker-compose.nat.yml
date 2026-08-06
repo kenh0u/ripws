@@ -11,12 +11,11 @@ services:
       ROLE: server
       MODE: kernel
       TUN_ADDR: 10.7.0.1/24
-      LISTEN: ":8080"
-      CONFIG: /cfg/server.json
+      LISTEN: "8080"
+      PSK: "${RIPWS_PSK}"
+      UUID: "${RIPWS_UUID}"
       NAT_ROUTES: "1.1.1.1/32,8.8.8.8/32"
       NAT_CLIENT_IP: "10.7.0.2"
-    volumes:
-      - ./config:/cfg:ro
     restart: "no"
 
   client:
@@ -28,12 +27,12 @@ services:
     environment:
       ROLE: client
       MODE: userspace
-      US_ADDR: 10.7.0.2
-      US_ROUTE: 10.7.0.0/24
-      US_NAT: "1"
+      TUN_ADDR: 10.7.0.2/24
       URL: ws://server:8080/${RIPWS_UUID}
       PSK: "${RIPWS_PSK}"
-      PING_INTERVAL: 30s
+      UUID: "${RIPWS_UUID}"
+      NAT: "1"
+      PING_INTERVAL: "30"
     restart: "no"
 
 networks:

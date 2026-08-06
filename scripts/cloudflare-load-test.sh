@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Cloudflare tunnel heavy load test: iperf3 (TCP/UDP/multi-stream) + ping RTT median.
+# Cloudflare tunnel heavy load test: iperf3 (TCP/UDP/multi-stream) + ping RTT.
+#
+# Client runs on the host via `ripws up` (kernel TUN mode).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
@@ -35,38 +37,40 @@ for _ in $(seq 1 20); do
 done
 grep "Registered" "$CFLOG" | head -1 || { echo "cloudflared failed"; tail -10 "$CFLOG"; exit 1; }
 
-# --- host client ---
-say "Starting ripws client on host"
-BEFORE="$(ls /sys/class/net/ 2>/dev/null | grep -E '^tun' | sort || true)"
-CLOG="$(mktemp)"
-sudo "$REPO/result/bin/ripws" client \
-    --url "wss://ripws-test.kenhou.xyz/$UUID" \
-    --psk "$PSK" --mode kernel --ping-interval 30s > "$CLOG" 2>&1 &
-CLPID=$!
-DEV=""
-for _ in $(seq 1 50); do
-    AFTER="$(ls /sys/class/net/ 2>/dev/null | grep -E '^tun' | sort || true)"
-    DEV="$(comm -13 <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") | head -1)"
-    [ -n "$DEV" ] && break
-    sleep 0.2
-done
-[ -z "$DEV" ] && { echo "no tun device"; tail -20 "$CLOG"; exit 1; }
-sudo ip addr add 10.7.0.2/24 dev "$DEV"
-sudo ip link set up dev "$DEV"
-sleep 2
-grep "connected" "$CLOG" || { echo "client not connected"; tail -10 "$CLOG"; exit 1; }
-echo "client connected, dev=$DEV"
+# --- host client via `ripws up` ---
+say "Starting ripws client on host (kernel TUN)"
+CLIENT_CONF="$(mktemp /tmp/ripws-client-XXXX.conf)"
+cat > "$CLIENT_CONF" <<EOF
+[Interface]
+Address = 10.7.0.2/24
+PrivateKey = $PSK
+Mode = kernel
+[Peer]
+PublicKey = $UUID
+Endpoint = wss://ripws-test.kenhou.xyz/$UUID
+AllowedIPs = 10.7.0.0/24
+PersistentKeepalive = 30
+EOF
 
-# --- Ping RTT median (1000 pings) ---
+CLOG="$(mktemp)"
+sudo "$REPO/result/bin/ripws" up "$CLIENT_CONF" > "$CLOG" 2>&1 &
+CLPID=$!
+sleep 3
+grep "connected" "$CLOG" || { echo "client not connected"; tail -20 "$CLOG"; exit 1; }
+echo "client connected, dev=ws0"
+
+# --- Ping RTT (1000 pings) ---
 say "Ping RTT test: 1000 pings for median"
-sudo ping -c 1000 -i 0.01 -W 5 -I "$DEV" 10.7.0.1 2>&1 | tee /tmp/cf-ping.txt | tail -5
+sudo ping -c 1000 -i 0.01 -W 5 -I ws0 10.7.0.1 2>&1 | tee /tmp/cf-ping.txt | tail -5
 echo "--- RTT stats ---"
 tail -1 /tmp/cf-ping.txt
 
-# --- iperf3 TCP (client -> server, 15s) ---
-say "iperf3 TCP client->server through Cloudflare (15s)"
+# --- iperf3 server on the server container ---
 sudo docker exec -d ripws-server iperf3 -s -p 5201
 sleep 1
+
+# --- iperf3 TCP (client -> server, 15s) ---
+say "iperf3 TCP client->server through Cloudflare (15s)"
 $IPERF3 -c 10.7.0.1 -p 5201 -t 15 -B 10.7.0.2 2>&1 | tee /tmp/cf-tcp-c2s.txt | tail -8
 
 # --- iperf3 TCP reverse (server -> client, 15s) ---
@@ -91,11 +95,10 @@ $IPERF3 -c 10.7.0.1 -p 5201 -t 15 -u -b 500M -B 10.7.0.2 2>&1 | tee /tmp/cf-udp-
 
 # --- Cleanup ---
 say "Cleanup"
-sudo kill "$CLPID" 2>/dev/null || true
+sudo "$REPO/result/bin/ripws" down "$CLIENT_CONF" 2>/dev/null || sudo kill "$CLPID" 2>/dev/null || true
 sleep 1
-sudo ip link del "$DEV" 2>/dev/null || true
 kill "$CFPID" 2>/dev/null || true
 sudo docker exec ripws-server pkill iperf3 2>/dev/null || true
 $DC down 2>&1 | tail -2
-rm -f "$CFLOG" "$CLOG"
+rm -f "$CFLOG" "$CLOG" "$CLIENT_CONF"
 echo "Done."

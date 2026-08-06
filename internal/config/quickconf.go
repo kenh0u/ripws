@@ -42,6 +42,8 @@ type InterfaceConfig struct {
 	MTU        int      // interface MTU (0 = default 1420)
 	DNS        []string // DNS servers to inject
 	Table      string   // "auto" (default) or "off"
+	Mode       string   // "kernel" (default) or "userspace"
+	NAT        bool     // userspace: enable NAT gateway
 	PreUp      []string // pre-up shell hooks
 	PostUp     []string // post-up shell hooks
 	PreDown    []string // pre-down shell hooks
@@ -71,6 +73,7 @@ func LoadQuickConfig(path string) (*QuickConfig, error) {
 	cfg := &QuickConfig{}
 	cfg.Interface.MTU = 0 // 0 means "use DefaultMTU" later
 	cfg.Interface.Table = "auto"
+	cfg.Interface.Mode = "kernel"
 
 	var section string
 	var currentPeer *PeerConfig
@@ -135,6 +138,9 @@ func LoadQuickConfig(path string) (*QuickConfig, error) {
 	if cfg.Interface.Table == "" {
 		cfg.Interface.Table = "auto"
 	}
+	if cfg.Interface.Mode == "" {
+		cfg.Interface.Mode = "kernel"
+	}
 
 	return cfg, nil
 }
@@ -161,6 +167,14 @@ func (c *QuickConfig) setInterface(key, val string, lineNo int) error {
 		c.Interface.DNS = appendCSV(c.Interface.DNS, val)
 	case "table":
 		c.Interface.Table = strings.ToLower(val)
+	case "mode":
+		c.Interface.Mode = strings.ToLower(val)
+	case "nat":
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return fmt.Errorf("ripws: config line %d: bad NAT %q", lineNo, val)
+		}
+		c.Interface.NAT = b
 	case "preup":
 		c.Interface.PreUp = append(c.Interface.PreUp, val)
 	case "postup":
@@ -213,6 +227,11 @@ func appendCSV(dst []string, val string) []string {
 // IsServer returns true when ListenPort is set (server mode).
 func (c *QuickConfig) IsServer() bool {
 	return c.Interface.ListenPort > 0
+}
+
+// IsUserspace returns true when Mode is "userspace" (gVisor netstack, no root).
+func (c *QuickConfig) IsUserspace() bool {
+	return c.Interface.Mode == "userspace"
 }
 
 // InterfaceName derives the interface name from the config file basename,

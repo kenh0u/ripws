@@ -18,14 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -169,66 +165,6 @@ func (u *Userspace) Stack() *stack.Stack { return u.stack }
 // NICID returns the tunnel NIC's identifier.
 func (u *Userspace) NICID() tcpip.NICID { return u.nicID }
 
-// Dial opens a connection through the userspace stack. It is a thin wrapper
-// around gonet so test programs can reach peers across the tunnel without
-// touching the kernel network namespace.
-func (u *Userspace) Dial(network, address string) (net.Conn, error) {
-	proto, addr, port, netProto, err := parseNetAddr(network, address)
-	if err != nil {
-		return nil, err
-	}
-	switch proto {
-	case tcp.ProtocolNumber:
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		return gonet.DialContextTCP(ctx, u.stack, tcpip.FullAddress{Addr: addr, Port: port}, netProto)
-	case udp.ProtocolNumber:
-		raddr := &tcpip.FullAddress{Addr: addr, Port: port}
-		return gonet.DialUDP(u.stack, nil, raddr, netProto)
-	default:
-		return nil, fmt.Errorf("ripws: unsupported transport %q", network)
-	}
-}
-
-// Listen binds a listener on the userspace stack.
-func (u *Userspace) Listen(network, address string) (net.Listener, error) {
-	proto, addr, port, netProto, err := parseNetAddr(network, address)
-	if err != nil {
-		return nil, err
-	}
-	switch proto {
-	case tcp.ProtocolNumber:
-		return gonet.ListenTCP(u.stack, tcpip.FullAddress{Addr: addr, Port: port}, netProto)
-	default:
-		return nil, fmt.Errorf("ripws: unsupported transport %q", network)
-	}
-}
-
-func parseNetAddr(network, address string) (tcpip.TransportProtocolNumber, tcpip.Address, uint16, tcpip.NetworkProtocolNumber, error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return 0, tcpip.Address{}, 0, 0, err
-	}
-	var port uint16
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
-		return 0, tcpip.Address{}, 0, 0, fmt.Errorf("ripws: bad port %q: %w", portStr, err)
-	}
-	var proto tcpip.TransportProtocolNumber
-	switch strings.ToLower(network) {
-	case "tcp", "tcp4", "tcp6":
-		proto = tcp.ProtocolNumber
-	case "udp", "udp4", "udp6":
-		proto = udp.ProtocolNumber
-	default:
-		return 0, tcpip.Address{}, 0, 0, fmt.Errorf("ripws: unsupported network %q", network)
-	}
-	netProto, addr, err := parseAddr(host)
-	if err != nil {
-		return 0, tcpip.Address{}, 0, 0, err
-	}
-	return proto, addr, port, netProto, nil
-}
-
 func parseAddr(s string) (tcpip.NetworkProtocolNumber, tcpip.Address, error) {
 	ip := net.ParseIP(s)
 	if ip == nil {
@@ -274,7 +210,5 @@ func parseSubnet(s string) (tcpip.Subnet, error) {
 	}
 	return tcpip.AddressWithPrefix{Address: addr, PrefixLen: ones}.Subnet(), nil
 }
-
-var _ = header.IPv4MinimumSize
 
 var _ Interface = (*Userspace)(nil)

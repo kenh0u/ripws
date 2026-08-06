@@ -3,7 +3,6 @@
 package tunnel
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,11 +11,25 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// bridge copies data bidirectionally between two connections until one side
+// closes, then closes both.
+func bridge(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(b, a)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	<-done
+}
 
 // EnableNAT installs TCP and UDP forwarders on the netstack so that transit
 // traffic arriving from the tunnel (destined for external IPs) is transparently
@@ -159,7 +172,3 @@ func udpBridge(local *gonet.UDPConn, remote net.Conn) {
 
 	wg.Wait()
 }
-
-var _ = io.Copy
-var _ = fmt.Sprintf
-var _ = stack.TransportEndpointID{}
