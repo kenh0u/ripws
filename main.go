@@ -94,10 +94,10 @@ up / down:
     PreUp/PostUp/PreDown/PostDown = shell hooks (repeatable)
 
   [Peer] section (repeatable):
-    PublicKey  = UUID       client identity / endpoint path
+    UUID       = UUIDv4     client identity / endpoint path
     PresharedKey = PSK      per-peer PSK (optional; overrides PrivateKey)
     AllowedIPs = CIDR       (repeatable) routes via tunnel
-    Endpoint   = URL        client: ws(s)://host:port/<uuid>
+    Endpoint   = URL        client: ws(s)://host:port
     PersistentKeepalive = N seconds (WebSocket Ping interval, 30..300)
 
   kernel mode requires CAP_NET_ADMIN + /dev/net/tun.
@@ -109,7 +109,7 @@ up / down:
     ListenPort = 8080
     PrivateKey = <psk>
     [Peer]
-    PublicKey  = <client-uuid>
+    UUID       = <client-uuid>
     AllowedIPs = 10.7.0.2/32
 
   Example client (ws0.conf):
@@ -117,8 +117,8 @@ up / down:
     Address    = 10.7.0.2/24
     PrivateKey = <psk>
     [Peer]
-    PublicKey  = <uuid>
-    Endpoint   = ws://server:8080/<uuid>
+    UUID       = <uuid>
+    Endpoint   = ws://server:8080
     AllowedIPs = 0.0.0.0/0
     PersistentKeepalive = 30
 
@@ -129,8 +129,8 @@ up / down:
     Mode    = userspace
     NAT     = true
     [Peer]
-    PublicKey  = <uuid>
-    Endpoint   = ws://server:8080/<uuid>
+    UUID       = <uuid>
+    Endpoint   = ws://server:8080
     AllowedIPs = 0.0.0.0/0
     PersistentKeepalive = 30`)
 }
@@ -156,8 +156,8 @@ func cmdUp(args []string) {
 	creds := config.New()
 	for _, peer := range cfg.Peers {
 		psk := cfg.PeerPSK(&peer)
-		if err := creds.Add(peer.PublicKey, psk); err != nil {
-			fatalf("up: peer %s: %v", peer.PublicKey, err)
+		if err := creds.Add(peer.UUID, psk); err != nil {
+			fatalf("up: peer %s: %v", peer.UUID, err)
 		}
 	}
 
@@ -292,12 +292,18 @@ func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interfac
 	}
 	peer := cfg.Peers[0]
 	if peer.Endpoint == "" {
-		fatalf("up: client [Peer] requires Endpoint = ws(s)://...")
+		fatalf("up: client [Peer] requires Endpoint = ws(s)://host:port")
+	}
+	if peer.UUID == "" {
+		fatalf("up: client [Peer] requires UUID")
 	}
 	psk := cfg.PeerPSK(&peer)
 	if err := config.ValidatePSK(psk); err != nil {
 		fatalf("up: %v", err)
 	}
+
+	// Construct the full WebSocket URL: endpoint + "/" + uuid
+	wsURL := strings.TrimRight(peer.Endpoint, "/") + "/" + peer.UUID
 
 	pingInterval := 60 * time.Second
 	if peer.PersistentKeepalive > 0 {
@@ -308,7 +314,7 @@ func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interfac
 	}
 
 	clCfg := client.Config{
-		URL:  peer.Endpoint,
+		URL:  wsURL,
 		PSK:  psk,
 		Tun:  tun,
 		Keep: proto.KeepAlive{Interval: pingInterval, PongTimeout: 15 * time.Second},

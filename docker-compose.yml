@@ -30,7 +30,7 @@ services:
       ROLE: client
       MODE: kernel
       TUN_ADDR: 10.7.0.2/24
-      URL: ws://server:8080/${RIPWS_UUID}
+      URL: ws://server:8080
       PSK: "${RIPWS_PSK}"
       UUID: "${RIPWS_UUID}"
       PING_INTERVAL: "30"

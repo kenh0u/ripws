@@ -31,3 +31,6 @@
 .vscode/
 .idea/
 *.iml
+
+# Internal handover docs (never commit)
+/HANDOVER.md

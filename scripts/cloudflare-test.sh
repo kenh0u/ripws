@@ -3,7 +3,7 @@
 #
 # Topology:
 #   host TUN ws0 10.7.0.2/24
-#     └─ ripws client (host, sudo, `ripws up`) ──wss://ripws-test.kenhou.xyz/<uuid>──▶
+#     └─ ripws client (host, sudo, `ripws up`) ──wss://ripws-test.kenhou.xyz──▶
 #           Cloudflare edge ──▶ cloudflared (host) ──▶ localhost:8080
 #           ──▶ ripws server container (TUN ws0 10.7.0.1/24)
 #
@@ -75,8 +75,8 @@ Address = 10.7.0.2/24
 PrivateKey = $PSK
 Mode = kernel
 [Peer]
-PublicKey = $UUID
-Endpoint = wss://ripws-test.kenhou.xyz/$UUID
+UUID = $UUID
+Endpoint = wss://ripws-test.kenhou.xyz
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF

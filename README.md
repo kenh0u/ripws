@@ -102,7 +102,7 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.7.0.2/32
 EOF
 
@@ -114,8 +114,8 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 30
 EOF
@@ -157,10 +157,10 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `PublicKey` | ✓ | Peer's UUIDv4 |
+| `UUID` | ✓ | Peer's UUIDv4 |
 | `PresharedKey` | (optional) | Per-peer PSK; overrides `PrivateKey` when present |
 | `AllowedIPs` | ✓ | Routes via this peer (CIDR, comma-separated) |
-| `Endpoint` | client only | `ws(s)://host:port/<uuid>` server URL |
+| `Endpoint` | client only | `ws(s)://host:port` server URL (UUID appended automatically) |
 | `PersistentKeepalive` | (optional) | WebSocket Ping interval in seconds (30–300) |
 
 ### WireGuard Field Mapping
@@ -168,7 +168,7 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 | WireGuard | RIPWS | Notes |
 |-----------|-------|-------|
 | `PrivateKey` | PSK | Authentication token (Bearer) |
-| `PublicKey` | UUID | Client identifier |
+| `PublicKey` | `UUID` | Client identifier (not a public key; renamed for clarity) |
 | `PresharedKey` | per-peer PSK | Per-peer PSK override |
 | `Endpoint` | ws(s):// URL | WebSocket endpoint |
 | `ListenPort` | listen port | Server mode detection |
@@ -209,7 +209,7 @@ ripws genkey
 ## genuuid
 
 Generates a fresh UUIDv4 — the client identity used as the WebSocket URL path
-and the `PublicKey` in `[Peer]` sections.
+and the `UUID` field in `[Peer]` sections.
 
 ```sh
 ripws genuuid
@@ -239,7 +239,7 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.7.0.2/32
 EOF
 
@@ -251,8 +251,8 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 30
 EOF
@@ -285,7 +285,7 @@ Mode       = kernel
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.8.0.2/32
 EOF
 sudo ripws up ws0.conf
@@ -299,8 +299,8 @@ Mode       = userspace
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 10.8.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -321,7 +321,7 @@ the internet via the client. No privileges required on the client side.
 ```
 Server (kernel TUN 10.7.0.1/24)
     │  ip route add 1.1.1.1/32 8.8.8.8/32 via 10.7.0.2
-    │  WebSocket ws://server:8080/<uuid>
+    │  WebSocket ws://server:8080
 Client (userspace netstack 10.7.0.2, NAT = true)
     │  gVisor TCP/UDP Forwarder → net.Dial → Internet
 Internet (1.1.1.1, 8.8.8.8, ...)
@@ -338,8 +338,8 @@ NAT        = true
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -388,8 +388,8 @@ Mode       = userspace
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = wss://ripws-test.example.com/$UUID
+UUID  = $UUID
+Endpoint   = wss://ripws-test.example.com
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -428,12 +428,12 @@ PrivateKey = $DEFAULT_PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID_A
+UUID  = $UUID_A
 PresharedKey = $PSK_A
 AllowedIPs = 10.7.0.2/32
 
 [Peer]
-PublicKey  = $UUID_B
+UUID  = $UUID_B
 PresharedKey = $PSK_B
 AllowedIPs = 10.7.0.3/32
 EOF
@@ -441,8 +441,8 @@ EOF
 sudo ripws up ws0.conf
 
 # Each client connects with its own UUID/PSK
-# Client A: Endpoint = ws://SERVER:8080/$UUID_A, PrivateKey = $PSK_A
-# Client B: Endpoint = ws://SERVER:8080/$UUID_B, PrivateKey = $PSK_B
+# Client A: Endpoint = ws://SERVER:8080, UUID = $UUID_A, PrivateKey = $PSK_A
+# Client B: Endpoint = ws://SERVER:8080, UUID = $UUID_B, PrivateKey = $PSK_B
 ```
 
 ---

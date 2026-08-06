@@ -45,8 +45,8 @@ Address = 10.7.0.2/24
 PrivateKey = $PSK
 Mode = kernel
 [Peer]
-PublicKey = $UUID
-Endpoint = wss://ripws-test.kenhou.xyz/$UUID
+UUID = $UUID
+Endpoint = wss://ripws-test.kenhou.xyz
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF

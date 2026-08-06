@@ -8,9 +8,9 @@
 // Field mapping (WireGuard → RIPWS):
 //
 //	PrivateKey   → PSK (the bearer-token pre-shared key)
-//	PublicKey    → UUID (the client identity / endpoint path component)
+//	UUID         → client identity / endpoint path component (replaces PublicKey)
 //	PresharedKey → per-peer PSK override (optional)
-//	Endpoint     → ws(s):// server URL (client only)
+//	Endpoint     → ws(s):// server URL, host:port only (client only)
 //	ListenPort   → server listen port (server only)
 //	AllowedIPs   → routes to install via the tunnel
 //	PersistentKeepalive → WebSocket Ping interval (seconds)
@@ -52,10 +52,10 @@ type InterfaceConfig struct {
 
 // PeerConfig holds a [Peer] section.
 type PeerConfig struct {
-	PublicKey           string   // UUID of this peer
+	UUID                string   // UUIDv4 of this peer
 	PresharedKey        string   // per-peer PSK (optional; overrides Interface PrivateKey)
 	AllowedIPs          []string // CIDR routes via tunnel for this peer
-	Endpoint            string   // ws(s):// URL (client only)
+	Endpoint            string   // ws(s)://host:port URL (client only, no UUID path)
 	PersistentKeepalive int      // WebSocket Ping interval in seconds (0 = default)
 }
 
@@ -193,8 +193,8 @@ func (c *QuickConfig) setInterface(key, val string, lineNo int) error {
 
 func (c *QuickConfig) setPeer(p *PeerConfig, key, val string, lineNo int) error {
 	switch key {
-	case "publickey", "uuid":
-		p.PublicKey = val
+	case "uuid":
+		p.UUID = val
 	case "presharedkey", "psk":
 		p.PresharedKey = val
 	case "allowedips":

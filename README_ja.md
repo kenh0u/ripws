@@ -88,7 +88,7 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.7.0.2/32
 EOF
 
@@ -100,8 +100,8 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 30
 EOF
@@ -142,10 +142,10 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 
 | フィールド | 必須 | 説明 |
 |-----------|------|------|
-| `PublicKey` | ✓ | peerのUUIDv4 |
+| `UUID` | ✓ | peerのUUIDv4 |
 | `PresharedKey` | (省略可) | peer個別のPSK。指定時は `PrivateKey` を上書き |
 | `AllowedIPs` | ✓ | このpeer経由のルート（CIDR、カンマ区切り複数可） |
-| `Endpoint` | clientのみ | `ws(s)://host:port/<uuid>` サーバーURL |
+| `Endpoint` | clientのみ | `ws(s)://host:port` サーバーURL（UUIDは自動でパスに追加） |
 | `PersistentKeepalive` | (省略可) | WebSocket Ping間隔（秒、30〜300） |
 
 ### WireGuardとの対応関係
@@ -153,7 +153,7 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 | WireGuard | RIPWS | 備考 |
 |-----------|-------|------|
 | `PrivateKey` | PSK | 認証トークン（Bearer） |
-| `PublicKey` | UUID | クライアント識別子 |
+| `PublicKey` | `UUID` | クライアント識別子（公開鍵ではなく秘匿対象、誤解を避けるためUUIDと命名） |
 | `PresharedKey` | per-peer PSK | peer個別のPSK上書き |
 | `Endpoint` | ws(s):// URL | WebSocketエンドポイント |
 | `ListenPort` | listen port | サーバーモード判定 |
@@ -192,7 +192,7 @@ ripws genkey
 
 ## genuuid
 
-UUIDv4を新規生成。WebSocketのURLパスおよび `[Peer]` の `PublicKey` に使用するクライアント識別子。
+UUIDv4を新規生成。WebSocketのURLパスおよび `[Peer]` の `UUID` に使用するクライアント識別子。
 
 ```sh
 ripws genuuid
@@ -221,7 +221,7 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.7.0.2/32
 EOF
 
@@ -233,8 +233,8 @@ PrivateKey = $PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 30
 EOF
@@ -267,7 +267,7 @@ Mode       = kernel
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
+UUID  = $UUID
 AllowedIPs = 10.8.0.2/32
 EOF
 sudo ripws up ws0.conf
@@ -281,8 +281,8 @@ Mode       = userspace
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 10.8.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -300,7 +300,7 @@ ripws up ws0.conf          # sudo不要
 ```
 サーバー (kernel TUN 10.7.0.1/24)
     │  ip route add 1.1.1.1/32 8.8.8.8/32 via 10.7.0.2
-    │  WebSocket ws://server:8080/<uuid>
+    │  WebSocket ws://server:8080
 クライアント (userspace netstack 10.7.0.2, NAT = true)
     │  gVisor TCP/UDP Forwarder → net.Dial → インターネット
 インターネット (1.1.1.1, 8.8.8.8, ...)
@@ -317,8 +317,8 @@ NAT        = true
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = ws://SERVER:8080/$UUID
+UUID  = $UUID
+Endpoint   = ws://SERVER:8080
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -364,8 +364,8 @@ Mode       = userspace
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID
-Endpoint   = wss://ripws-test.example.com/$UUID
+UUID  = $UUID
+Endpoint   = wss://ripws-test.example.com
 AllowedIPs = 10.7.0.0/24
 PersistentKeepalive = 30
 EOF
@@ -400,12 +400,12 @@ PrivateKey = $DEFAULT_PSK
 MTU        = 1420
 
 [Peer]
-PublicKey  = $UUID_A
+UUID  = $UUID_A
 PresharedKey = $PSK_A
 AllowedIPs = 10.7.0.2/32
 
 [Peer]
-PublicKey  = $UUID_B
+UUID  = $UUID_B
 PresharedKey = $PSK_B
 AllowedIPs = 10.7.0.3/32
 EOF
@@ -413,8 +413,8 @@ EOF
 sudo ripws up ws0.conf
 
 # 各クライアントは自身のUUID/PSKで接続
-# クライアントA: Endpoint = ws://SERVER:8080/$UUID_A, PrivateKey = $PSK_A
-# クライアントB: Endpoint = ws://SERVER:8080/$UUID_B, PrivateKey = $PSK_B
+# クライアントA: Endpoint = ws://SERVER:8080, UUID = $UUID_A, PrivateKey = $PSK_A
+# クライアントB: Endpoint = ws://SERVER:8080, UUID = $UUID_B, PrivateKey = $PSK_B
 ```
 
 ---

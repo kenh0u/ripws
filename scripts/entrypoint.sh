@@ -12,7 +12,7 @@
 #   LISTEN       server: listen port (default 8080)
 #   PSK          pre-shared key (base64, 44 chars)
 #   UUID         peer UUID (also used as URL path component on client)
-#   URL          client: ws(s)://host:port/<uuid> endpoint
+#   URL          client: ws(s)://host:port endpoint (UUID appended automatically)
 #   PING_INTERVAL client: WebSocket Ping interval in seconds (default 60)
 #   NAT          userspace: enable NAT gateway (1/0)
 #   NAT_ROUTES   server kernel: comma-separated CIDRs to route via tunnel
@@ -68,7 +68,7 @@ build_config() {
         fi
         echo ""
         echo "[Peer]"
-        echo "PublicKey = ${UUID}"
+        echo "UUID = ${UUID}"
         if [ "$ROLE" = "server" ]; then
             # Server: allow the client's /32 plus any NAT target CIDRs.
             client_ip=$(peer_ip "$local_addr")

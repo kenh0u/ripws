@@ -28,7 +28,7 @@ services:
       ROLE: client
       MODE: userspace
       TUN_ADDR: 10.7.0.2/24
-      URL: ws://server:8080/${RIPWS_UUID}
+      URL: ws://server:8080
       PSK: "${RIPWS_PSK}"
       UUID: "${RIPWS_UUID}"
       NAT: "1"
