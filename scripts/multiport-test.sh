@@ -17,11 +17,24 @@ BASE=5201
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
-# Assumes the kernel-mode stack from load-test.sh is already up; if not, bring
-# it up here.
+DC="sudo -E docker compose"
+
+# Bring up the kernel-mode stack if not already running.
 if ! sudo docker ps --format '{{.Names}}' | grep -q '^ripws-server$'; then
     say "Stack not running; starting it"
-    bash scripts/load-test.sh >/dev/null 2>&1 || true
+    nix build .#ripws --no-link
+    mkdir -p bin && rm -f bin/ripws && cp -L result/bin/ripws bin/ripws
+    $DC build
+    UUID="$(nix run .#ripws -- genuuid)"
+    PSK="$(nix run .#ripws -- genkey)"
+    mkdir -p config && printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
+    export RIPWS_UUID="$UUID" RIPWS_PSK="$PSK"
+    $DC down --remove-orphans 2>/dev/null || true
+    $DC up -d server
+    sleep 2
+    $DC up -d client
+    sleep 3
+    sudo docker exec ripws-client ping -c 2 -W 2 10.7.0.1
 fi
 
 say "Starting $N iperf3 servers on ports $BASE..$((BASE+N-1))"
@@ -55,12 +68,14 @@ if [ "$fail" -gt 0 ]; then
 fi
 
 say "Aggregate throughput across $N parallel single-stream connections"
-# receiver line: "[  5]   0.00-8.00  sec  ...  X.XX Gbits/sec  receiver"
-# pull the token just before "receiver" (the bitrate value) and its unit.
+# receiver line: "[  5]   0.00-8.00  sec  47.6 MBytes  50.0 Mbits/sec  receiver"
+# NF-1 = "Mbits/sec", NF-2 = bitrate value
 grep -h "receiver" "$logs_dir"/*.log \
-    | awk '{print $(NF-1), $(NF-2)}' \
-    | awk '{s+=$1} END {printf "Total receiver bitrate: %.2f %s\n", s, "Gbits/sec"}'
+    | awk '{print $(NF-2)}' \
+    | awk '{s+=$1} END {printf "Total receiver bitrate: %.2f Gbits/sec\n", s/1000}'
 
 echo "--- sample log (port $BASE) ---"
 sed -n '1,14p' "$logs_dir/port-$BASE.log"
 rm -rf "$logs_dir"
+
+$DC down 2>&1 | tail -2
