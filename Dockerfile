@@ -13,7 +13,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        iproute2 iputils-ping procps ca-certificates curl jq iperf3 \
+        iproute2 iputils-ping procps ca-certificates curl jq iperf3 dnsutils \
  && rm -rf /var/lib/apt/lists/*
 
 # The nix-built static binary is staged into ./bin/ripws by the test script

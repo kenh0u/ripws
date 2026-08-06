@@ -93,9 +93,15 @@ client flags:
                            the TUN device (printed at startup)
   --us-addr IP[,IP...]     userspace: local virtual IP(s)
   --us-route CIDR[,CIDR..] userspace: routes via tunnel NIC (default "0.0.0.0/0,::/0")
-  --us-dial ADDR           userspace: one-shot echo probe target (e.g. 10.8.0.1:7)
-  --us-dial-interval D     repeat the probe at this interval (default 5s)
-  --ping-interval D        WebSocket Ping interval, 30s..300s (default 60s)
+   --us-dial ADDR           userspace: one-shot echo probe target (e.g. 10.8.0.1:7)
+   --us-dial-interval D     repeat the probe at this interval (default 5s)
+   --us-ping IP             userspace: send ICMP pings to this IP (e.g. 10.8.0.1)
+   --us-ping-count N        number of ping probes (default 4)
+   --us-ping-interval D     interval between pings (default 1s)
+   --us-forward L=R         userspace: TCP forward LOCAL=REMOTE (e.g. 127.0.0.1:5201=10.8.0.1:5201)
+   --us-udp-forward L=R     userspace: UDP forward LOCAL=REMOTE
+   --us-nat                 userspace: enable NAT gateway (tunnel traffic proxied out via host net)
+   --ping-interval D        WebSocket Ping interval, 30s..300s (default 60s)
   --ping-pong-timeout D    Pong wait before declaring dead (default 15s)
   --backoff-base D         initial reconnect delay (default 500ms)
   --backoff-max D          reconnect delay cap (default 60s)
@@ -219,9 +225,15 @@ func cmdClient(args []string) {
 	tunAddr := fs.String("tun-addr", "", "kernel: informational TUN address")
 	usAddr := fs.String("us-addr", "", "userspace: local virtual IP(s)")
 	usRoute := fs.String("us-route", "0.0.0.0/0,::/0", "userspace: routes (comma CIDRs)")
-	usDial := fs.String("us-dial", "", "userspace: one-shot echo probe target")
-	usDialInterval := fs.Duration("us-dial-interval", 5*time.Second, "probe repeat interval")
-	pingInterval := fs.Duration("ping-interval", 60*time.Second, "WebSocket Ping interval (30s..300s)")
+	 usDial := fs.String("us-dial", "", "userspace: one-shot echo probe target")
+	 usDialInterval := fs.Duration("us-dial-interval", 5*time.Second, "probe repeat interval")
+	 usPing := fs.String("us-ping", "", "userspace: send ICMP pings to this IP (e.g. 10.8.0.1)")
+	 usPingCount := fs.Int("us-ping-count", 4, "userspace: number of ping probes")
+	 usPingInterval := fs.Duration("us-ping-interval", 1*time.Second, "userspace: interval between pings")
+	 usForward := fs.String("us-forward", "", "userspace: TCP port forward LOCAL=REMOTE (repeatable; e.g. 127.0.0.1:5201=10.8.0.1:5201)")
+	 usUDPForward := fs.String("us-udp-forward", "", "userspace: UDP port forward LOCAL=REMOTE")
+	 usNAT := fs.Bool("us-nat", false, "userspace: enable NAT gateway — transit traffic from tunnel is proxied out via host networking")
+	 pingInterval := fs.Duration("ping-interval", 60*time.Second, "WebSocket Ping interval (30s..300s)")
 	pongTimeout := fs.Duration("ping-pong-timeout", 15*time.Second, "Pong wait")
 	backoffBase := fs.Duration("backoff-base", 500*time.Millisecond, "initial reconnect delay")
 	backoffMax := fs.Duration("backoff-max", 60*time.Second, "reconnect delay cap")
@@ -250,10 +262,38 @@ func cmdClient(args []string) {
 		}
 	}
 
-	// Optional userspace connectivity probe.
-	if *mode == "userspace" && *usDial != "" {
-		startUserspaceProbe(tun, *usDial, *usDialInterval)
-	}
+	 // Optional userspace connectivity probe.
+	 if *mode == "userspace" && *usDial != "" {
+		 startUserspaceProbe(tun, *usDial, *usDialInterval)
+	 }
+
+	 // Optional userspace ICMP ping.
+	 if *mode == "userspace" && *usPing != "" {
+		 startUserspacePing(tun, *usPing, *usPingCount, *usPingInterval)
+	 }
+
+	 // Optional userspace TCP/UDP port forwarding.
+	 if *mode == "userspace" {
+		 if *usForward != "" {
+			 startUserspaceForward(tun, *usForward, false)
+		 }
+		 if *usUDPForward != "" {
+			 startUserspaceForward(tun, *usUDPForward, true)
+		 }
+	 }
+
+	 // Optional userspace NAT gateway: transit traffic from the tunnel is
+	 // transparently proxied out through the host's kernel networking.
+	 if *mode == "userspace" && *usNAT {
+		 us, ok := tun.(*tunnel.Userspace)
+		 if !ok {
+			 log.Printf("client: --us-nat requires --mode=userspace")
+		 } else {
+			 if err := us.EnableNAT(log.New(os.Stderr, "client: ", log.LstdFlags|log.Lmicroseconds)); err != nil {
+				 log.Printf("client: --us-nat: %v", err)
+			 }
+		 }
+	 }
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -309,6 +349,79 @@ func startUserspaceProbe(t tunnel.Interface, addr string, every time.Duration) {
 				log.Printf("client: probe %s OK rtt=%s", addr, time.Since(start))
 			} else {
 				log.Printf("client: probe %s MISMATCH got %q", addr, buf)
+			}
+		}
+	}()
+}
+
+// startUserspacePing sends ICMP echo requests through the netstack and logs
+// each result (RTT or error). It runs once and exits.
+func startUserspacePing(t tunnel.Interface, dst string, count int, interval time.Duration) {
+	us, ok := t.(*tunnel.Userspace)
+	if !ok {
+		log.Printf("client: --us-ping requires --mode=userspace")
+		return
+	}
+	go func() {
+		// Wait briefly for the tunnel to come up.
+		time.Sleep(2 * time.Second)
+		log.Printf("client: PING %s (%d probes, %s interval)", dst, count, interval)
+		ctx := context.Background()
+		sent, recv, minRTT, maxRTT, totalRTT := 0, 0, time.Duration(0), time.Duration(0), time.Duration(0)
+		for r := range us.Ping(ctx, dst, count, interval) {
+			sent++
+			if r.Error != nil {
+				log.Printf("client: ping seq=%d: %v", r.Seq, r.Error)
+			} else {
+				recv++
+				if minRTT == 0 || r.RTT < minRTT {
+					minRTT = r.RTT
+				}
+				if r.RTT > maxRTT {
+					maxRTT = r.RTT
+				}
+				totalRTT += r.RTT
+				log.Printf("client: ping seq=%d rtt=%s", r.Seq, r.RTT)
+			}
+		}
+		loss := 0
+		if sent > 0 {
+			loss = (sent - recv) * 100 / sent
+		}
+		avg := time.Duration(0)
+		if recv > 0 {
+			avg = totalRTT / time.Duration(recv)
+		}
+		log.Printf("client: ping %s: %d sent, %d recv, %d%% loss, min=%s avg=%s max=%s",
+			dst, sent, recv, loss, minRTT, avg, maxRTT)
+	}()
+}
+
+// startUserspaceForward starts a TCP or UDP port forwarder bridging a kernel
+// listener to a remote address through the netstack.
+func startUserspaceForward(t tunnel.Interface, spec string, udp bool) {
+	us, ok := t.(*tunnel.Userspace)
+	if !ok {
+		log.Printf("client: --us-forward requires --mode=userspace")
+		return
+	}
+	listen, remote, err := tunnel.ParseForwardSpec(spec)
+	if err != nil {
+		log.Printf("client: bad forward spec %q: %v", spec, err)
+		return
+	}
+	go func() {
+		if udp {
+			f := tunnel.NewUDPForwarder(us, listen, remote)
+			f.SetLogger(log.New(os.Stderr, "client: ", log.LstdFlags|log.Lmicroseconds))
+			if err := f.Serve(); err != nil {
+				log.Printf("client: udp-forward %s -> %s: %v", listen, remote, err)
+			}
+		} else {
+			f := tunnel.NewForwarder(us, listen, remote)
+			f.SetLogger(log.New(os.Stderr, "client: ", log.LstdFlags|log.Lmicroseconds))
+			if err := f.Serve(); err != nil {
+				log.Printf("client: forward %s -> %s: %v", listen, remote, err)
 			}
 		}
 	}()
