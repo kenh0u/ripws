@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -56,10 +55,10 @@ func main() {
 		cmdUp(os.Args[2:])
 	case "down":
 		cmdDown(os.Args[2:])
-	case "gen-psk":
-		cmdGenPSK(os.Args[2:])
-	case "gen-config":
-		cmdGenConfig(os.Args[2:])
+	case "genkey":
+		cmdGenKey(os.Args[2:])
+	case "genuuid":
+		cmdGenUUID(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -75,8 +74,8 @@ func usage() {
 usage:
   ripws up   <config.conf>  bring up a tunnel
   ripws down <config.conf>  tear down a tunnel
-  ripws gen-psk             print a fresh 32-byte base64 PSK
-  ripws gen-config          print JSON mapping a fresh UUID to a fresh PSK
+  ripws genkey             print a fresh 32-byte base64 PSK
+  ripws genuuid            print a fresh UUIDv4
 
 up / down:
   Uses a wg-quick-style INI config file. The interface name is derived from
@@ -405,8 +404,8 @@ func pidFilePath(ifName string) string {
 	return filepath.Join("/tmp", "ripws-"+ifName+".pid")
 }
 
-func cmdGenPSK(args []string) {
-	fs := flag.NewFlagSet("gen-psk", flag.ExitOnError)
+func cmdGenKey(args []string) {
+	fs := flag.NewFlagSet("genkey", flag.ExitOnError)
 	mustParse(fs, args)
 	b := make([]byte, config.PSKLen)
 	if _, err := rand.Read(b); err != nil {
@@ -415,20 +414,10 @@ func cmdGenPSK(args []string) {
 	fmt.Println(base64.StdEncoding.EncodeToString(b))
 }
 
-func cmdGenConfig(args []string) {
-	fs := flag.NewFlagSet("gen-config", flag.ExitOnError)
+func cmdGenUUID(args []string) {
+	fs := flag.NewFlagSet("genuuid", flag.ExitOnError)
 	mustParse(fs, args)
-	b := make([]byte, config.PSKLen)
-	if _, err := rand.Read(b); err != nil {
-		must(err)
-	}
-	id := uuid.New()
-	obj := map[string]string{id.String(): base64.StdEncoding.EncodeToString(b)}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(obj); err != nil {
-		must(err)
-	}
+	fmt.Println(uuid.New())
 }
 
 func mustParse(fs *flag.FlagSet, args []string) {

@@ -30,11 +30,10 @@ mkdir -p bin && rm -f bin/ripws && cp -L result/bin/ripws bin/ripws
 
 # 2. Credentials.
 say "Generating credentials"
-CRED_JSON="$(nix run .#ripws -- gen-config)"
-UUID="$(printf '%s' "$CRED_JSON" | jq -r 'keys[0]')"
-PSK="$(printf '%s' "$CRED_JSON" | jq -r ".[\"$UUID\"]")"
+UUID="$(nix run .#ripws -- genuuid)"
+PSK="$(nix run .#ripws -- genkey)"
 mkdir -p config
-printf '%s\n' "$CRED_JSON" > config/server.json
+printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
 echo "UUID=$UUID  PSK=${PSK:0:10}..."
 
 # 3. Build image and launch.

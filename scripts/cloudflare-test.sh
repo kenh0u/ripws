@@ -31,10 +31,9 @@ nix build .#ripws --no-link
 mkdir -p bin && rm -f bin/ripws && cp -L result/bin/ripws bin/ripws
 $DC build
 
-CRED_JSON="$(nix run .#ripws -- gen-config)"
-UUID="$(printf '%s' "$CRED_JSON" | jq -r 'keys[0]')"
-PSK="$(printf '%s' "$CRED_JSON" | jq -r ".[\"$UUID\"]")"
-mkdir -p config && printf '%s' "$CRED_JSON" > config/server.json
+UUID="$(nix run .#ripws -- genuuid)"
+PSK="$(nix run .#ripws -- genkey)"
+mkdir -p config && printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
 echo "UUID=$UUID  PSK=$PSK"
 
 export RIPWS_UUID="$UUID" RIPWS_PSK="$PSK"

@@ -34,13 +34,11 @@ cp -L result/bin/ripws bin/ripws
 
 # 2. Mint a single client credential (UUID + 44-char base64 PSK).
 say "Generating credentials"
-CRED_JSON="$(nix run .#ripws -- gen-config)"
-echo "$CRED_JSON"
-UUID="$(printf '%s' "$CRED_JSON" | jq -r 'keys[0]')"
-PSK="$(printf '%s' "$CRED_JSON" | jq -r ".[\"$UUID\"]")"
+UUID="$(nix run .#ripws -- genuuid)"
+PSK="$(nix run .#ripws -- genkey)"
 echo "UUID=$UUID  PSK=$PSK"
 mkdir -p config
-printf '%s\n' "$CRED_JSON" > config/server.json
+printf 'UUID=%s\nPSK=%s\n' "$UUID" "$PSK" > config/creds.env
 
 # 3. Build the test image (copies the nix binary in).
 say "Building Docker image"
