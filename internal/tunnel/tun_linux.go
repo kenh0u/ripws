@@ -27,10 +27,14 @@ type tunKernel struct {
 //
 // This mirrors Tailscale's approach of decoupling device creation from
 // address management so the same binary runs unprivileged for the data path.
-func NewKernel() (Interface, error) {
-	ifce, err := water.New(water.Config{
-		DeviceType: water.TUN,
-	})
+//
+// If name is non-empty, the TUN device is created with that name (e.g. "ws0").
+func NewKernel(name string) (Interface, error) {
+	cfg := water.Config{DeviceType: water.TUN}
+	if name != "" {
+		cfg.Name = name
+	}
+	ifce, err := water.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ripws: create TUN: %w", err)
 	}

@@ -2,7 +2,8 @@
 
 L3の生IPパケットをWebSocketバイナリフレームでトンネリングする、Tailscale風味の極小VPN実装。仕様は [`SPEC.md`](SPEC.md) を参照。
 
-- シングルバイナリ `server` / `client` / `gen-psk` / `gen-config` サブコマンド
+- シングルバイナリ `up` / `down` / `server` / `client` / `gen-psk` / `gen-config` サブコマンド
+- **wg-quick互換設定** — `ripws up ws0.conf` でTUN作成・アドレス割当・MTU・ルート・DNS・PreUp/PostUpフックを全自動設定
 - **Silent Drop** — 不正UUID・不正PSKは即座にTCP RST（`SO_LINGER=0`）、HTTPレスポンスなし
 - 2つのL3バックエンドを `tunnel.Interface` で統一:
   - `kernel` — ホストTUNデバイス（`songgao/water`）、`CAP_NET_ADMIN` + `/dev/net/tun` 必要
@@ -18,6 +19,8 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
 
 - [ビルド](#ビルド)
 - [サブコマンド概要](#サブコマンド概要)
+- [クイックスタート (wg-quick風)](#クイックスタート-wg-quick風)
+- [wg-quick互換設定ファイル](#wg-quick互換設定ファイル)
 - [gen-psk](#gen-psk)
 - [gen-config](#gen-config)
 - [server](#server)
@@ -63,12 +66,117 @@ go build -o ripws .
 ## サブコマンド概要
 
 ```
-ripws server     [flags]    RIPWSサーバーを起動
-ripws client     [flags]    RIPWSクライアントを起動
-ripws gen-psk               新規32バイトBase64 PSKを生成
-ripws gen-config            新規UUIDに新規PSKを割り当てたJSONを生成
-ripws help                  ヘルプを表示
+ripws up   <config.conf>  wg-quick風にトンネルを起動（TUN作成・アドレス・MTU・ルート・DNS・フック全自動）
+ripws down <config.conf>  トンネルを停止（インターフェース削除・DNS復元・フック）
+ripws server   [flags]    RIPWSサーバーを起動（インターフェース手動設定）
+ripws client   [flags]    RIPWSクライアントを起動（インターフェース手動設定）
+ripws gen-psk              新規32バイトBase64 PSKを生成
+ripws gen-config           新規UUIDに新規PSKを割り当てたJSONを生成
+ripws help                 ヘルプを表示
 ```
+
+---
+
+## クイックスタート (wg-quick風)
+
+`ripws up` / `ripws down` はwg-quick互換のINI設定ファイルを使って、TUN作成からアドレス割当・MTU設定・ルート追加・DNS注入・PreUp/PostUpフックまで全て自動で行います。`CAP_NET_ADMIN` が必要です。
+
+```sh
+# 認証情報生成
+ripws gen-config > /tmp/creds.json
+UUID="$(jq -r 'keys[0]' /tmp/creds.json)"
+PSK="$(jq -r ".[\"$UUID\"]" /tmp/creds.json)"
+
+# --- サーバー設定 (/etc/ripws/ws0.conf) ---
+cat > /tmp/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.7.0.2/32
+EOF
+
+# --- クライアント設定 (/etc/ripws/ws0.conf) ---
+cat > /tmp/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 30
+EOF
+
+# 起動
+sudo ripws up /tmp/ws0.conf        # インターフェース名はファイル名から自動決定 (ws0.conf → ws0)
+
+# 停止
+sudo ripws down /tmp/ws0.conf
+```
+
+> `/etc/ripws/ws0.conf` に置けば `ripws up ws0` / `ripws down ws0` と省略可能。
+
+---
+
+## wg-quick互換設定ファイル
+
+INI形式で `[Interface]` セクションと複数の `[Peer]` セクションを記述します。
+
+### [Interface] セクション
+
+| フィールド | 必須 | 説明 |
+|-----------|------|------|
+| `Address` | ✓ | インターフェースに割り当てるCIDRアドレス（カンマ区切り複数可） |
+| `ListenPort` | serverのみ | サーバーのリッスンポート。指定時はサーバーモードで動作 |
+| `PrivateKey` | ✓ | デフォルトPSK（base64 44文字）。`PresharedKey` でpeer個別に上書き可 |
+| `MTU` | (デフォルト1420) | インターフェースMTU |
+| `DNS` | (省略可) | `/etc/resolv.conf` に注入するDNSサーバー（カンマ区切り複数可） |
+| `Table` | (デフォルト `auto`) | `off` でルート追加をスキップ |
+| `PreUp` | (省略可) | インターフェース起動前に実行するシェルコマンド（複数行可） |
+| `PostUp` | (省略可) | インターフェース起動後に実行するシェルコマンド（複数行可） |
+| `PreDown` | (省略可) | インターフェース停止前に実行するシェルコマンド（複数行可） |
+| `PostDown` | (省略可) | インターフェース停止後に実行するシェルコマンド（複数行可） |
+
+### [Peer] セクション
+
+| フィールド | 必須 | 説明 |
+|-----------|------|------|
+| `PublicKey` | ✓ | peerのUUIDv4 |
+| `PresharedKey` | (省略可) | peer個別のPSK。指定時は `PrivateKey` を上書き |
+| `AllowedIPs` | ✓ | このpeer経由のルート（CIDR、カンマ区切り複数可） |
+| `Endpoint` | clientのみ | `ws(s)://host:port/<uuid>` サーバーURL |
+| `PersistentKeepalive` | (省略可) | WebSocket Ping間隔（秒、30〜300） |
+
+### WireGuardとの対応関係
+
+| WireGuard | RIPWS | 備考 |
+|-----------|-------|------|
+| `PrivateKey` | PSK | 認証トークン（Bearer） |
+| `PublicKey` | UUID | クライアント識別子 |
+| `PresharedKey` | per-peer PSK | peer個別のPSK上書き |
+| `Endpoint` | ws(s):// URL | WebSocketエンドポイント |
+| `ListenPort` | listen port | サーバーモード判定 |
+| `AllowedIPs` | routes | トンネル経由ルート |
+| `PersistentKeepalive` | Ping間隔 | WebSocket Ping (30〜300秒) |
+| `MTU`, `DNS`, `Table`, `PreUp/PostUp/PreDown/PostDown` | 同名同機能 | wg-quick互換 |
+
+### サーバー・クライアント判定
+
+- `ListenPort` が指定されている → **サーバー**（HTTPサーバーを起動）
+- 指定されていない → **クライアント**（最初の `[Peer]` の `Endpoint` に接続）
+
+### インターフェース名の決定
+
+設定ファイルのベース名から `.conf` を取り除いたものがインターフェース名になります:
+- `ws0.conf` → `ws0`
+- `/etc/ripws/tunnel1.conf` → `tunnel1`
 
 ---
 
@@ -517,15 +625,17 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## プロジェクトレイアウト
 
 ```
-main.go                      flagベース server/client/gen-* ディスパッチ
+main.go                      flagベース up/down/server/client/gen-* ディスパッチ
 flake.nix                    buildGoModule（静的バイナリ）
 internal/
   config/                    JSON + flag認証情報、PSKバリデーション (SPEC 2.2)
+    quickconf.go             wg-quick互換INIパーサー
   proto/                     IPバージョンニブル、キープアライブ、指数バックオフ
   tunnel/
     tunnel.go                Interface 抽象契約
     tun_linux.go             kernel TUN バックエンド (songgao/water)
     netstack.go              gVisor userspace バックエンド (netstack)
+    setup_linux.go           wg-quick風 ifup/ifdown (addr/MTU/routes/DNS/hooks)
     ping.go                  userspace ICMP ping (gVisor ICMP endpoint)
     forward.go               userspace TCP/UDP ポートフォワーダ
     nat.go                   userspace NATゲートウェイ (gVisor Forwarder → net.Dial)

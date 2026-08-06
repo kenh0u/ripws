@@ -5,7 +5,8 @@
 A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 [`SPEC.md`](SPEC.md)): raw L3 packets tunneled over a WebSocket binary stream.
 
-- Single binary with `server` / `client` / `gen-psk` / `gen-config` subcommands.
+- Single binary with `up` / `down` / `server` / `client` / `gen-psk` / `gen-config` subcommands.
+- **wg-quick-compatible configuration** — `ripws up ws0.conf` automatically creates the TUN device, assigns addresses, configures MTU, routes, DNS, and runs PreUp/PostUp hooks.
 - **Silent Drop** — unknown UUID or bad PSK ⇒ immediate TCP RST
   (`SO_LINGER=0`), no HTTP response.
 - Two L3 backends behind one `tunnel.Interface`:
@@ -28,6 +29,8 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 
 - [Build](#build)
 - [Subcommand Overview](#subcommand-overview)
+- [Quick Start (wg-quick style)](#quick-start-wg-quick-style)
+- [wg-quick-compatible Config File](#wg-quick-compatible-config-file)
 - [gen-psk](#gen-psk)
 - [gen-config](#gen-config)
 - [server](#server)
@@ -75,12 +78,120 @@ go build -o ripws .
 ## Subcommand Overview
 
 ```
-ripws server     [flags]    Start the RIPWS server
-ripws client     [flags]    Start the RIPWS client
+ripws up   <config.conf>  Bring up a tunnel wg-quick-style (TUN creation, addr, MTU, routes, DNS, hooks)
+ripws down <config.conf>  Tear down a tunnel (remove interface, restore DNS, hooks)
+ripws server   [flags]    Start the RIPWS server (manual interface setup)
+ripws client   [flags]    Start the RIPWS client (manual interface setup)
 ripws gen-psk               Generate a fresh 32-byte Base64 PSK
 ripws gen-config            Generate JSON mapping a fresh UUID to a fresh PSK
 ripws help                  Show help
 ```
+
+---
+
+## Quick Start (wg-quick style)
+
+`ripws up` / `ripws down` use a wg-quick-compatible INI config file to fully
+automate TUN creation, address assignment, MTU, route addition, DNS injection,
+and PreUp/PostUp hooks. Requires `CAP_NET_ADMIN`.
+
+```sh
+# Generate credentials
+ripws gen-config > /tmp/creds.json
+UUID="$(jq -r 'keys[0]' /tmp/creds.json)"
+PSK="$(jq -r ".[\"$UUID\"]" /tmp/creds.json)"
+
+# --- Server config (/etc/ripws/ws0.conf) ---
+cat > /tmp/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.7.0.2/32
+EOF
+
+# --- Client config (/etc/ripws/ws0.conf) ---
+cat > /tmp/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 30
+EOF
+
+# Bring up
+sudo ripws up /tmp/ws0.conf        # Interface name auto-derived from filename (ws0.conf -> ws0)
+
+# Bring down
+sudo ripws down /tmp/ws0.conf
+```
+
+> If placed at `/etc/ripws/ws0.conf`, you can abbreviate: `ripws up ws0` /
+> `ripws down ws0`.
+
+---
+
+## wg-quick-compatible Config File
+
+Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
+
+### [Interface] Section
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `Address` | ✓ | CIDR address(es) assigned to the interface (comma-separated) |
+| `ListenPort` | server only | Server listen port. When present, runs in server mode |
+| `PrivateKey` | ✓ | Default PSK (base64, 44 chars). Overridden per-peer by `PresharedKey` |
+| `MTU` | (default 1420) | Interface MTU |
+| `DNS` | (optional) | DNS server(s) injected into `/etc/resolv.conf` (comma-separated) |
+| `Table` | (default `auto`) | `off` skips route addition |
+| `PreUp` | (optional) | Shell command(s) to run before interface comes up (multiple lines allowed) |
+| `PostUp` | (optional) | Shell command(s) to run after interface comes up (multiple lines allowed) |
+| `PreDown` | (optional) | Shell command(s) to run before interface goes down (multiple lines allowed) |
+| `PostDown` | (optional) | Shell command(s) to run after interface goes down (multiple lines allowed) |
+
+### [Peer] Section
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `PublicKey` | ✓ | Peer's UUIDv4 |
+| `PresharedKey` | (optional) | Per-peer PSK; overrides `PrivateKey` when present |
+| `AllowedIPs` | ✓ | Routes via this peer (CIDR, comma-separated) |
+| `Endpoint` | client only | `ws(s)://host:port/<uuid>` server URL |
+| `PersistentKeepalive` | (optional) | WebSocket Ping interval in seconds (30–300) |
+
+### WireGuard Field Mapping
+
+| WireGuard | RIPWS | Notes |
+|-----------|-------|-------|
+| `PrivateKey` | PSK | Authentication token (Bearer) |
+| `PublicKey` | UUID | Client identifier |
+| `PresharedKey` | per-peer PSK | Per-peer PSK override |
+| `Endpoint` | ws(s):// URL | WebSocket endpoint |
+| `ListenPort` | listen port | Server mode detection |
+| `AllowedIPs` | routes | Tunnel routes |
+| `PersistentKeepalive` | Ping interval | WebSocket Ping (30–300 s) |
+| `MTU`, `DNS`, `Table`, `PreUp/PostUp/PreDown/PostDown` | same name, same function | wg-quick compatible |
+
+### Server vs Client Detection
+
+- `ListenPort` present → **server** (starts HTTP server)
+- `ListenPort` absent → **client** (connects to first `[Peer]`'s `Endpoint`)
+
+### Interface Name Derivation
+
+The interface name is derived from the config file's basename minus `.conf`:
+- `ws0.conf` → `ws0`
+- `/etc/ripws/tunnel1.conf` → `tunnel1`
 
 ---
 
@@ -552,15 +663,17 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## Project Layout
 
 ```
-main.go                      flag-based server/client/gen-* dispatch
+main.go                      flag-based up/down/server/client/gen-* dispatch
 flake.nix                    buildGoModule (static binary)
 internal/
   config/                    JSON + flag credentials, PSK validation (SPEC 2.2)
+    quickconf.go             wg-quick-compatible INI parser
   proto/                     IP-version nibble, keep-alive, exponential backoff
   tunnel/
     tunnel.go                Interface abstract contract
     tun_linux.go             kernel TUN backend (songgao/water)
     netstack.go              gVisor userspace backend (netstack)
+    setup_linux.go           wg-quick-style ifup/ifdown (addr/MTU/routes/DNS/hooks)
     ping.go                  userspace ICMP ping (gVisor ICMP endpoint)
     forward.go               userspace TCP/UDP port forwarder
     nat.go                   userspace NAT gateway (gVisor Forwarder → net.Dial)

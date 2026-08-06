@@ -48,6 +48,10 @@ func main() {
 		cmdServer(os.Args[2:])
 	case "client":
 		cmdClient(os.Args[2:])
+	case "up":
+		cmdUp(os.Args[2:])
+	case "down":
+		cmdDown(os.Args[2:])
 	case "gen-psk":
 		cmdGenPSK(os.Args[2:])
 	case "gen-config":
@@ -65,10 +69,40 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `ripws - Raw IP over WebSocket
 
 usage:
-  ripws server   [flags]   run the RIPWS server
-  ripws client   [flags]   run the RIPWS client
+  ripws up   <config.conf>  bring up a tunnel using a wg-quick-style config
+  ripws down <config.conf>  tear down a tunnel
+  ripws server   [flags]   run the RIPWS server (manual interface config)
+  ripws client   [flags]   run the RIPWS client (manual interface config)
   ripws gen-psk             print a fresh 32-byte base64 PSK
   ripws gen-config          print JSON mapping a fresh UUID to a fresh PSK
+
+up / down:
+  Uses a wg-quick-style INI config file. The interface name is derived from
+  the filename (e.g. ws0.conf -> ws0). Supports Address, ListenPort,
+  PrivateKey/PSK, MTU, DNS, Table, PreUp/PostUp/PreDown/PostDown, and
+  per-peer PublicKey/UUID, PresharedKey, AllowedIPs, Endpoint,
+  PersistentKeepalive. Requires CAP_NET_ADMIN (kernel mode only).
+
+  Example server config (ws0.conf):
+    [Interface]
+    Address    = 10.7.0.1/24
+    ListenPort = 8080
+    PrivateKey = <psk>
+    MTU        = 1420
+    [Peer]
+    PublicKey  = <client-uuid>
+    AllowedIPs = 10.7.0.2/32
+
+  Example client config (ws0.conf):
+    [Interface]
+    Address    = 10.7.0.2/24
+    PrivateKey = <psk>
+    MTU        = 1420
+    [Peer]
+    PublicKey  = <uuid>
+    Endpoint   = ws://server:8080/<uuid>
+    AllowedIPs = 0.0.0.0/0
+    PersistentKeepalive = 30
 
 server flags:
   --listen ADDR            listen address (default ":8080")
@@ -428,6 +462,177 @@ func startUserspaceForward(t tunnel.Interface, spec string, udp bool) {
 }
 
 // ---------------------------------------------------------------------------
+// up / down — wg-quick-style convenience subcommands
+// ---------------------------------------------------------------------------
+
+// resolveConfigPath converts a bare interface name (e.g. "ws0") into
+// /etc/ripws/ws0.conf if the argument has no path separator or .conf suffix.
+func resolveConfigPath(arg string) string {
+	if strings.ContainsAny(arg, "/") || strings.HasSuffix(arg, ".conf") {
+		return arg
+	}
+	return "/etc/ripws/" + arg + ".conf"
+}
+
+func cmdUp(args []string) {
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	mustParse(fs, args)
+	if fs.NArg() < 1 {
+		fatalf("up: config file required (e.g. ripws up ws0.conf)")
+	}
+	path := resolveConfigPath(fs.Arg(0))
+
+	cfg, err := config.LoadQuickConfig(path)
+	must(err)
+
+	ifName := config.InterfaceName(path)
+
+	// Build credentials from [Peer] sections.
+	creds := config.New()
+	for _, peer := range cfg.Peers {
+		psk := cfg.PeerPSK(&peer)
+		if err := creds.Add(peer.PublicKey, psk); err != nil {
+			fatalf("up: peer %s: %v", peer.PublicKey, err)
+		}
+	}
+
+	// Create TUN with the desired name.
+	tun, err := tunnel.NewKernel(ifName)
+	must(err)
+	defer tun.Close()
+
+	log.Printf("up: created interface %s", tun.Name())
+
+	// Auto-configure the interface (addresses, MTU, routes, DNS, hooks).
+	setup := &tunnel.InterfaceSetup{
+		Name:     tun.Name(),
+		Address:  cfg.Interface.Address,
+		MTU:      cfg.Interface.MTU,
+		Routes:   cfg.AllAllowedIPs(),
+		DNS:      cfg.Interface.DNS,
+		Table:    cfg.Interface.Table,
+		PreUp:    cfg.Interface.PreUp,
+		PostUp:   cfg.Interface.PostUp,
+		PreDown:  cfg.Interface.PreDown,
+		PostDown: cfg.Interface.PostDown,
+	}
+	must(setup.Up())
+	log.Printf("up: interface %s configured (addr=%v mtu=%d routes=%v)", tun.Name(), cfg.Interface.Address, cfg.Interface.MTU, cfg.AllAllowedIPs())
+
+	// Determine server vs client.
+	if cfg.IsServer() {
+		runUpServer(cfg, creds, tun, setup)
+	} else {
+		runUpClient(cfg, tun, setup)
+	}
+}
+
+func runUpServer(cfg *config.QuickConfig, creds *config.Credentials, tun tunnel.Interface, setup *tunnel.InterfaceSetup) {
+	listen := fmt.Sprintf(":%d", cfg.Interface.ListenPort)
+	srv := server.New(creds, tun)
+	srv.Logger = log.New(os.Stderr, "server: ", log.LstdFlags|log.Lmicroseconds)
+	srv.Keep.Window = 330 * time.Second
+
+	httpSrv := &http.Server{
+		Addr:              listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Printf("up: shutting down server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}()
+
+	log.Printf("up: server listening on %s", listen)
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fatalf("up: server: %v", err)
+	}
+
+	log.Printf("up: bringing down interface %s", setup.Name)
+	if err := setup.Down(); err != nil {
+		log.Printf("up: teardown error: %v", err)
+	}
+}
+
+func runUpClient(cfg *config.QuickConfig, tun tunnel.Interface, setup *tunnel.InterfaceSetup) {
+	if len(cfg.Peers) == 0 {
+		fatalf("up: client config requires at least one [Peer] with Endpoint")
+	}
+	peer := cfg.Peers[0]
+	if peer.Endpoint == "" {
+		fatalf("up: client [Peer] requires Endpoint = ws(s)://...")
+	}
+	psk := cfg.PeerPSK(&peer)
+	if err := config.ValidatePSK(psk); err != nil {
+		fatalf("up: %v", err)
+	}
+
+	pingInterval := 60 * time.Second
+	if peer.PersistentKeepalive > 0 {
+		pingInterval = time.Duration(peer.PersistentKeepalive) * time.Second
+	}
+	if pingInterval < 30*time.Second || pingInterval > 300*time.Second {
+		fatalf("up: PersistentKeepalive must be within [30, 300] seconds")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	clCfg := client.Config{
+		URL:  peer.Endpoint,
+		PSK:  psk,
+		Tun:  tun,
+		Keep: proto.KeepAlive{Interval: pingInterval, PongTimeout: 15 * time.Second},
+		Backoff: proto.Backoff{
+			Base: 500 * time.Millisecond,
+			Max:  60 * time.Second,
+		},
+		Logger: log.New(os.Stderr, "client: ", log.LstdFlags|log.Lmicroseconds),
+	}
+	if err := client.Run(ctx, clCfg); err != nil && !errors.Is(err, context.Canceled) {
+		fatalf("up: client: %v", err)
+	}
+
+	log.Printf("up: bringing down interface %s", setup.Name)
+	if err := setup.Down(); err != nil {
+		log.Printf("up: teardown error: %v", err)
+	}
+}
+
+func cmdDown(args []string) {
+	fs := flag.NewFlagSet("down", flag.ExitOnError)
+	mustParse(fs, args)
+	if fs.NArg() < 1 {
+		fatalf("down: config file required (e.g. ripws down ws0.conf)")
+	}
+	path := resolveConfigPath(fs.Arg(0))
+
+	cfg, err := config.LoadQuickConfig(path)
+	must(err)
+
+	ifName := config.InterfaceName(path)
+
+	setup := &tunnel.InterfaceSetup{
+		Name:     ifName,
+		PreDown:  cfg.Interface.PreDown,
+		PostDown: cfg.Interface.PostDown,
+		DNS:      cfg.Interface.DNS,
+	}
+	if err := setup.Down(); err != nil {
+		fatalf("down: %v", err)
+	}
+	log.Printf("down: interface %s removed", ifName)
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -437,7 +642,7 @@ func startUserspaceForward(t tunnel.Interface, spec string, udp bool) {
 func openTunnel(mode, tunName, usAddr, usRoute string) (tunnel.Interface, error) {
 	switch strings.ToLower(mode) {
 	case "kernel", "tun":
-		return tunnel.NewKernel()
+		return tunnel.NewKernel(tunName)
 	case "userspace", "netstack":
 		addrs := splitCSV(usAddr)
 		routes := parseRoutes(usRoute)
