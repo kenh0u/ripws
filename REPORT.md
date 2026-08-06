@@ -2,16 +2,19 @@
 
 **Date:** 2026-08-06  
 **Build:** ripws 0.1.0 (Nix `buildGoModule`, Go 1.26.5, CGO disabled)  
-**Platform:** NixOS, Linux x86_64, Docker 29.6
+**Platform:** NixOS, Linux x86_64, Docker 29.6  
+**CLI:** `ripws up <config.conf>` / `ripws down <iface>` / `ripws gen-psk` / `ripws gen-config`
 
 ---
 
-## 1. L3 Connectivity (Kernel TUN)
+## 1. L3 Connectivity (Kernel Mode — TUN)
+
+**Topology:** ripws-client (ws0 10.7.0.2/24) → WebSocket → ripws-server (ws0 10.7.0.1/24)
 
 | Direction | Packets | Loss | RTT (min/avg/max) |
 |-----------|---------|------|--------------------|
-| Client → Server | 5/5 | 0% | 0.16 / 0.42 / 0.57 ms |
-| Server → Client | 3/3 | 0% | 0.10 / 0.25 / 0.34 ms |
+| Client → Server | 4/4 | 0% | 0.458 / 0.577 / 0.829 ms |
+| Server → Client | 4/4 | 0% | 0.195 / 0.402 / 0.650 ms |
 
 **Verdict:** PASS — bidirectional L3 tunnel fully functional.
 
@@ -29,27 +32,47 @@
 
 ---
 
-## 3. Userspace Mode (gVisor Netstack)
+## 3. Userspace NAT Gateway (Server → Tunnel → Client → Internet)
 
-| Test | Result |
-|------|--------|
-| TCP echo (probe 10.8.0.1:7) | OK, RTT ≈ 1 ms |
+**Topology:**
+```
+ripws-server (kernel TUN 10.7.0.1/24)
+    |  ip route add 1.1.1.1/32, 8.8.8.8/32 via 10.7.0.2
+    |  WebSocket ws://server:8080/<uuid>
+ripws-client (userspace netstack 10.7.0.2, NAT = true)
+    |  gVisor TCP/UDP Forwarder → net.Dial → Docker bridge → internet
+internet (1.1.1.1, 8.8.8.8, example.com)
+```
 
-**Verdict:** PASS — gVisor userspace backend works without `CAP_NET_ADMIN`.
+The client runs in userspace mode (`Mode = userspace`, `NAT = true` in INI config). Transit traffic from the server destined for external IPs is intercepted by gVisor's TCP/UDP forwarders and transparently proxied out through the host's kernel networking via `net.Dial`. No `CAP_NET_ADMIN` or kernel TUN is required on the client.
+
+| Test | Protocol | Result |
+|------|----------|--------|
+| `curl http://1.1.1.1/` | TCP 80 | HTTP 301, 0.026s, 167 bytes |
+| `curl https://1.1.1.1/` | TCP 443 (TLS) | HTTP 301, 0.058s |
+| `dig @8.8.8.8 example.com` | UDP 53 | Resolved: 104.20.23.154, 172.66.147.243 |
+
+**NAT log sample (client):**
+```
+nat: userspace NAT enabled (TCP+UDP forwarder installed)
+nat: tcp 10.7.0.1:55638 -> 1.1.1.1:80
+nat: tcp 1.1.1.1:80 closed
+nat: tcp 10.7.0.1:33562 -> 1.1.1.1:443
+nat: tcp 1.1.1.1:443 closed
+nat: udp 10.7.0.1:59537 -> 8.8.8.8:53
+```
+
+**Verdict:** PASS — server→tunnel→client(userspace NAT)→internet works for TCP, UDP, and DNS. The client acts as a transparent NAT gateway without any kernel privileges.
 
 ---
 
-## 4. iperf3 Throughput (Kernel TUN)
+## 4. iperf3 Throughput (Kernel Mode — TUN)
 
 | Test | Direction | Bitrate | Notes |
 |------|-----------|---------|-------|
-| TCP single stream | client → server | **1.60 Gbps** | 77 retransmits / 10s |
-| TCP single stream | server → client (reverse) | **1.11 Gbps** | 168 retransmits / 10s |
-| UDP 200 Mbps | client → server | **200 Mbps**, 0% loss | 172,638 datagrams, jitter 0.025 ms |
-| TCP -P 16 (16 parallel) | client → server | **1.68 Gbps** | 13,613 total retransmits |
-| TCP -P 64 (64 parallel) | client → server | **1.65 Gbps** | aggregate across 64 streams |
+| TCP -P 64 (64 parallel) | client → server | **1.64 Gbps** sender / **1.63 Gbps** receiver | 61,167 total retransmits / 10s |
 
-**Verdict:** PASS — multi-Gbps throughput, near-zero UDP loss.
+**Verdict:** PASS — multi-Gbps throughput.
 
 ---
 
@@ -60,6 +83,7 @@
 | Concurrent connections | 32 |
 | Distinct ports | 32 (5201–5232) |
 | Success rate | **32/32 (100%)** |
+| Per-stream bitrate (sample) | ~63 Mbps |
 
 **Verdict:** PASS — all 32 simultaneous connections established and completed successfully.
 
@@ -81,8 +105,8 @@
 
 ```
 $ go test -race -timeout 120s ./...
-ok  	ripws/internal/config	1.011s
-ok  	ripws/internal/proto	1.509s
+ok  	ripws/internal/config	1.013s
+ok  	ripws/internal/proto	(cached)
 ?   	ripws/internal/client	[no test files]
 ?   	ripws/internal/pipe	[no test files]
 ?   	ripws/internal/server	[no test files]
@@ -112,114 +136,15 @@ ok  	ripws/internal/proto	1.509s
 
 ---
 
-## 9. Userspace Mode — Full Benchmark (Client gVisor + Server Kernel)
-
-**Topology:** ripws-client (userspace netstack 10.8.0.2, no CAP_NET_ADMIN) → WebSocket → ripws-server (kernel TUN 10.8.0.1/24, iperf3 -B 10.8.0.1)
-
-Client uses `--us-ping` (gVisor ICMP endpoint), `--us-forward` (TCP), `--us-udp-forward` (UDP) to reach the server through the tunnel without any kernel TUN device.
-
-### ICMP Ping (gVisor ICMP endpoint, 10 probes)
-
-| Metric | Value |
-|--------|-------|
-| Sent / Received | 10 / 10 |
-| Loss | 0% |
-| RTT min / avg / max | 0.31 / 0.69 / 1.08 ms |
-
-### iperf3 Throughput (TCP/UDP via userspace port forward)
-
-| Test | Direction | Bitrate | Notes |
-|------|-----------|---------|-------|
-| TCP single stream | client → server | **1.56 Gbps** | 157 retransmits / 10s |
-| TCP single stream | server → client (reverse) | **1.04 Gbps** | |
-| TCP -P 8 (8 parallel) | client → server | **2.01 Gbps** | |
-| UDP 200 Mbps | client → server | **199 Mbps**, 0.03% loss | jitter 0.032 ms |
-| UDP 1 Gbps | client → server | **999 Mbps**, 4.3% loss | jitter 0.037 ms |
-
-**Verdict:** PASS — userspace mode delivers multi-Gbps TCP and near-line-rate UDP without any kernel TUN or privileges.
-
----
-
-## 10. Userspace NAT Gateway (Server → Tunnel → Client → Internet)
-
-**Topology:**
-```
-ripws-server (kernel TUN 10.7.0.1/24)
-    |  ip route add 1.1.1.1/32, 8.8.8.8/32 via 10.7.0.2
-    |  WebSocket ws://server:8080/<uuid>
-ripws-client (userspace netstack 10.7.0.2, --us-nat)
-    |  gVisor TCP/UDP Forwarder → net.Dial → Docker bridge → internet
-internet (1.1.1.1, 8.8.8.8, example.com)
-```
-
-The client runs in userspace mode with `--us-nat`. Transit traffic from the server destined for external IPs is intercepted by gVisor's TCP/UDP forwarders and transparently proxied out through the host's kernel networking via `net.Dial`. No `CAP_NET_ADMIN` or kernel TUN is required on the client.
-
-| Test | Protocol | Result |
-|------|----------|--------|
-| `curl http://1.1.1.1/` | TCP 80 | HTTP 301, 0.029s, 167 bytes |
-| `curl https://1.1.1.1/` | TCP 443 (TLS) | HTTP 301, 0.054s |
-| `dig @8.8.8.8 example.com` | UDP 53 | Resolved: 104.20.23.154, 172.66.147.243 |
-| `curl http://example.com/` | TCP 80 (DNS+TCP) | HTTP 200, 0.060s |
-
-**NAT log sample (client):**
-```
-nat: tcp 10.7.0.1:56724 -> 1.1.1.1:80
-nat: tcp 10.7.0.1:43328 -> 1.1.1.1:443
-nat: udp 10.7.0.1:35606 -> 8.8.8.8:53
-```
-
-**Verdict:** PASS — server→tunnel→client(userspace NAT)→internet works for TCP, UDP, and DNS. The client acts as a transparent NAT gateway without any kernel privileges.
-
----
-
-## 11. Cloudflare Tunnel — Userspace Mode E2E
-
-**Topology:**
-```
-host client (gVisor netstack 10.7.0.2, no CAP_NET_ADMIN)
-    → wss://ripws-test.kenhou.xyz/<uuid>
-    → Cloudflare edge (nrt15)
-    → cloudflared --protocol http2 (host)
-    → localhost:8080
-    → ripws-server container (kernel TUN 10.7.0.1/24, iperf3 -B 10.7.0.1)
-```
-
-Client uses `--mode userspace` with `--us-ping` (gVisor ICMP), `--us-forward` (TCP), `--us-udp-forward` (UDP) — no kernel TUN, no privileges.
-
-### ICMP Ping (100 probes, 0.1s interval)
-
-| Metric | Value |
-|--------|-------|
-| RTT (sample) | ~229–231 ms |
-| Loss | 0% (all 100 probes delivered) |
-
-### iperf3 Throughput (via Cloudflare HTTP/2 WebSocket)
-
-| Test | Direction | Bitrate | Notes |
-|------|-----------|---------|-------|
-| TCP single stream | client → server | **32 Mbps** | 9 retransmits |
-| TCP single stream | server → client (reverse) | **66 Mbps** | |
-| TCP -P 8 | client → server | **36 Mbps** | |
-| TCP -P 32 | client → server | **49 Mbps** | |
-| UDP 100 Mbps | client → server | **100 Mbps**, 0% loss | jitter 0.326 ms |
-| UDP 500 Mbps | client → server | **499 Mbps**, 0% loss | jitter 0.193 ms |
-
-**Verdict:** PASS — userspace mode works end-to-end through Cloudflare. TCP throughput is limited by CF edge (32–66 Mbps single stream), but UDP achieves near-line-rate with zero loss. RTT ~230ms reflects CF edge round-trip (same as kernel mode).
-
----
-
 ## Summary
 
 | Category | Result |
 |----------|--------|
-| L3 connectivity | PASS |
+| L3 connectivity (kernel mode) | PASS |
 | Silent Drop security | PASS |
-| Userspace (gVisor) | PASS |
-| Throughput (iperf3, kernel) | PASS (1.6+ Gbps) |
+| Userspace NAT gateway | PASS (TCP/UDP/DNS via tunnel → internet) |
+| Throughput (iperf3, kernel) | PASS (1.64 Gbps -P64) |
 | Multi-port concurrency | PASS (32/32) |
 | Reconnection & KeepAlive | PASS |
-| Race detector | PASS |
+| Race detector & unit tests | PASS |
 | Cloudflare tunnel (kernel) | PASS (wss://, bidirectional, RTT ~232ms) |
-| Userspace ping + iperf (direct) | PASS (0% loss, 2.0 Gbps -P8) |
-| Userspace NAT gateway | PASS (TCP/UDP/DNS via tunnel → internet) |
-| Cloudflare tunnel (userspace) | PASS (wss://, 0% ping loss, UDP 499 Mbps 0% loss) |

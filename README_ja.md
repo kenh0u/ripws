@@ -2,16 +2,16 @@
 
 L3の生IPパケットをWebSocketバイナリフレームでトンネリングする、Tailscale風味の極小VPN実装。仕様は [`SPEC.md`](SPEC.md) を参照。
 
-- シングルバイナリ `up` / `down` / `server` / `client` / `gen-psk` / `gen-config` サブコマンド
+- シングルバイナリ `up` / `down` / `gen-psk` / `gen-config` サブコマンド
 - **wg-quick互換設定** — `ripws up ws0.conf` でTUN作成・アドレス割当・MTU・ルート・DNS・PreUp/PostUpフックを全自動設定
 - **Silent Drop** — 不正UUID・不正PSKは即座にTCP RST（`SO_LINGER=0`）、HTTPレスポンスなし
 - 2つのL3バックエンドを `tunnel.Interface` で統一:
-  - `kernel` — ホストTUNデバイス（`songgao/water`）、`CAP_NET_ADMIN` + `/dev/net/tun` 必要
-  - `userspace` — gVisor netstackインプロセス、**権限不要・TUN不要**
+  - `kernel` — ホストTUNデバイス（`songgao/water`）、`CAP_NET_ADMIN` + `/dev/net/tun` 必要（wg-quick互換）
+  - `userspace` — gVisor netstackインプロセス、**権限不要・TUN不要**（Tailscale互換）
+- **Userspace NATゲートウェイ** — トンネル通過トランジットトラフィックをホスト側ネットワークへ透過的にNAT転送（`net.Dial`）、権限不要
 - 双方向ゴルーチンプロキシパイプ（`TUN ↔ WS`）、`sync.Pool`バッファ、IPバージョンニブル検証
 - WebSocket Ping/Pongキープアライブ（30–300秒、ジッター付き）、サーバー読み取りウィンドウ ≥ 最遅Ping
 - 指数バックオフ + フルジッター再接続
-- **Userspace NATゲートウェイ** — トンネル通過トランジットトラフィックをホスト側ネットワークへ透過的にNAT転送（`net.Dial`）、権限不要
 
 ---
 
@@ -19,21 +19,16 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
 
 - [ビルド](#ビルド)
 - [サブコマンド概要](#サブコマンド概要)
-- [クイックスタート (wg-quick風)](#クイックスタート-wg-quick風)
-- [wg-quick互換設定ファイル](#wg-quick互換設定ファイル)
+- [クイックスタート](#クイックスタート)
+- [設定ファイル形式](#設定ファイル形式)
 - [gen-psk](#gen-psk)
 - [gen-config](#gen-config)
-- [server](#server)
-- [client](#client)
 - [使用例](#使用例)
   - [1. カーネルモード（基本トンネル）](#1-カーネルモード基本トンネル)
   - [2. ユーザースペースモード（権限不要）](#2-ユーザースペースモード権限不要)
-  - [3. ユーザースペース ICMP Ping](#3-ユーザースペース-icmp-ping)
-  - [4. ユーザースペース TCP/UDP ポートフォワード](#4-ユーザースペース-tcpudp-ポートフォワード)
-  - [5. ユーザースペース NATゲートウェイ](#5-ユーザースペース-natゲートウェイ)
-  - [6. Cloudflare Tunnel経由 (wss://)](#6-cloudflare-tunnel経由-wss)
-  - [7. 複数クライアント（JSON設定ファイル）](#7-複数クライアントjson設定ファイル)
-  - [8. Echo プローブ（ユーザースペース疎通確認）](#8-echo-プローブユーザースペース疎通確認)
+  - [3. ユーザースペース NATゲートウェイ](#3-ユーザースペース-natゲートウェイ)
+  - [4. Cloudflare Tunnel経由 (wss://)](#4-cloudflare-tunnel経由-wss)
+  - [5. 複数クライアント（JSON設定ファイル）](#5-複数クライアントjson設定ファイル)
 - [テストスクリプト](#テストスクリプト)
 - [Dockerテスト](#dockerテスト)
 - [プロジェクトレイアウト](#プロジェクトレイアウト)
@@ -53,12 +48,12 @@ nix develop                # go / gopls が使える開発シェル
 
 `flake.nix` は `buildGoModule` を使用。gVisorバージョンは `go.mod` でピン留め。
 
-> **注意:** Nix flakeはGit追跡済みファイルからビルドするため、新規ファイルは `git add` してから `nix build` すること。
+> **注意:** Nix flakeはGit追跡済みファイルからビルドするため、変更をコミットしてから `nix build` すること。
 
 ### Goで直接ビルド
 
 ```sh
-go build -o ripws .
+CGO_ENABLED=0 go build -o ripws .
 ```
 
 ---
@@ -66,10 +61,8 @@ go build -o ripws .
 ## サブコマンド概要
 
 ```
-ripws up   <config.conf>  wg-quick風にトンネルを起動（TUN作成・アドレス・MTU・ルート・DNS・フック全自動）
-ripws down <config.conf>  トンネルを停止（インターフェース削除・DNS復元・フック）
-ripws server   [flags]    RIPWSサーバーを起動（インターフェース手動設定）
-ripws client   [flags]    RIPWSクライアントを起動（インターフェース手動設定）
+ripws up   <config.conf>  トンネルを起動（TUN/netstack作成・アドレス・MTU・ルート・DNS・フック全自動）
+ripws down <iface|conf>   実行中のトンネルを停止（SIGTERM + クリーンアップ）
 ripws gen-psk              新規32バイトBase64 PSKを生成
 ripws gen-config           新規UUIDに新規PSKを割り当てたJSONを生成
 ripws help                 ヘルプを表示
@@ -77,9 +70,9 @@ ripws help                 ヘルプを表示
 
 ---
 
-## クイックスタート (wg-quick風)
+## クイックスタート
 
-`ripws up` / `ripws down` はwg-quick互換のINI設定ファイルを使って、TUN作成からアドレス割当・MTU設定・ルート追加・DNS注入・PreUp/PostUpフックまで全て自動で行います。`CAP_NET_ADMIN` が必要です。
+`ripws up` / `ripws down` はwg-quick互換のINI設定ファイルを使って、インターフェース作成からアドレス割当・MTU設定・ルート追加・DNS注入・PreUp/PostUpフックまで全て自動で行います。
 
 ```sh
 # 認証情報生成
@@ -100,7 +93,7 @@ PublicKey  = $UUID
 AllowedIPs = 10.7.0.2/32
 EOF
 
-# --- クライアント設定 (/etc/ripws/ws0.conf) ---
+# --- クライアント設定 ---
 cat > /tmp/ws0.conf << EOF
 [Interface]
 Address    = 10.7.0.2/24
@@ -125,7 +118,7 @@ sudo ripws down /tmp/ws0.conf
 
 ---
 
-## wg-quick互換設定ファイル
+## 設定ファイル形式
 
 INI形式で `[Interface]` セクションと複数の `[Peer]` セクションを記述します。
 
@@ -137,6 +130,8 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 | `ListenPort` | serverのみ | サーバーのリッスンポート。指定時はサーバーモードで動作 |
 | `PrivateKey` | ✓ | デフォルトPSK（base64 44文字）。`PresharedKey` でpeer個別に上書き可 |
 | `MTU` | (デフォルト1420) | インターフェースMTU |
+| `Mode` | (デフォルト `kernel`) | `kernel`（TUN、CAP_NET_ADMIN必要）または `userspace`（gVisor netstack、権限不要） |
+| `NAT` | (デフォルト `false`) | userspaceのみ: NATゲートウェイ有効化（トンネル通過トラフィックをホストネットワークへ転送） |
 | `DNS` | (省略可) | `/etc/resolv.conf` に注入するDNSサーバー（カンマ区切り複数可） |
 | `Table` | (デフォルト `auto`) | `off` でルート追加をスキップ |
 | `PreUp` | (省略可) | インターフェース起動前に実行するシェルコマンド（複数行可） |
@@ -172,6 +167,11 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 - `ListenPort` が指定されている → **サーバー**（HTTPサーバーを起動）
 - 指定されていない → **クライアント**（最初の `[Peer]` の `Endpoint` に接続）
 
+### カーネル・ユーザースペースモード切替
+
+- `Mode = kernel`（デフォルト）→ ホストTUNデバイスを使用、`CAP_NET_ADMIN` + `/dev/net/tun` 必要
+- `Mode = userspace` → gVisor netstackをインプロセスで使用、権限不要
+
 ### インターフェース名の決定
 
 設定ファイルのベース名から `.conf` を取り除いたものがインターフェース名になります:
@@ -189,8 +189,6 @@ ripws gen-psk
 # 出力例: 8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk=
 ```
 
-オプション: なし
-
 ---
 
 ## gen-config
@@ -205,71 +203,6 @@ ripws gen-config
 # }
 ```
 
-オプション: なし
-
----
-
-## server
-
-RIPWSサーバーを起動。WebSocketアップグレード後にL3パケットのトンネル端点として動作。
-
-### フラグ一覧
-
-| フラグ | デフォルト | 説明 |
-|--------|-----------|------|
-| `--listen ADDR` | `:8080` | リッスンアドレス |
-| `--config PATH` | (空) | UUID→PSKマッピングのJSONファイル（複数クライアント対応） |
-| `--uuid UUID` | (空) | 単一クライアントのUUID（`--config`と併用可） |
-| `--psk PSK` | (空) | 単一クライアントのPSK |
-| `--mode kernel\|userspace` | `kernel` | L3バックエンド選択 |
-| `--tun-name NAME` | (空) | kernel: TUNデバイス名のヒント（ベストエフォート） |
-| `--us-addr IP[,IP...]` | (空) | userspace: netstack NICに割り当てる仮想IP（カンマ区切り複数可） |
-| `--us-route CIDR[,CIDR..]` | `0.0.0.0/0,::/0` | userspace: トンネルNIC経由のルート（カンマ区切り複数可） |
-| `--us-echo ADDR` | (空) | userspace: netstack内にTCP echoリスナーを起動（例: `10.8.0.1:7`） |
-| `--ping-window D` | `330s` | クライアント生存判定の読み取りデッドライン（最遅Ping 300s以上） |
-
-> `--config` と `--uuid`/`--psk` は併用可。両方指定した場合、フラグの認証情報が追加マージされる。最低1つの認証情報が必須。
-
-### 認証ファイル形式
-
-```json
-{
-  "client-a-uuid": "client-a-psk-base64",
-  "client-b-uuid": "client-b-psk-base64"
-}
-```
-
----
-
-## client
-
-RIPWSクライアントを起動。WebSocketでサーバーに接続し、L3パケットを双方向にブリッジ。切断時は指数バックオフ + ジッターで再接続。
-
-### フラグ一覧
-
-| フラグ | デフォルト | 説明 |
-|--------|-----------|------|
-| `--url URL` | (必須) | `ws(s)://host:port/<uuid>` エンドポイント |
-| `--psk PSK` | (必須) | Pre-Shared Key（Bearerトークン） |
-| `--mode kernel\|userspace` | `kernel` | L3バックエンド選択 |
-| `--tun-name NAME` | (空) | kernel: TUNデバイス名のヒント |
-| `--tun-addr ADDR` | (空) | kernel: TUNに割り当てるアドレス（起動時に案内を表示。実際のIP割り当ては手動） |
-| `--us-addr IP[,IP...]` | (空) | userspace: ローカル仮想IP（カンマ区切り複数可） |
-| `--us-route CIDR[,CIDR..]` | `0.0.0.0/0,::/0` | userspace: トンネル経由ルート |
-| `--us-dial ADDR` | (空) | userspace: ワンショットechoプローブ対象（例: `10.8.0.1:7`） |
-| `--us-dial-interval D` | `5s` | echoプローブの繰り返し間隔 |
-| `--us-ping IP` | (空) | userspace: ICMP ping送信先IP（例: `10.8.0.1`） |
-| `--us-ping-count N` | `4` | pingプローブ回数 |
-| `--us-ping-interval D` | `1s` | pingプローブ間隔 |
-| `--us-forward L=R` | (空) | userspace: TCPポートフォワード `LOCAL=REMOTE`（例: `127.0.0.1:5201=10.8.0.1:5201`） |
-| `--us-udp-forward L=R` | (空) | userspace: UDPポートフォワード `LOCAL=REMOTE` |
-| `--us-nat` | `false` | userspace: NATゲートウェイ有効化（トンネル通過トランジットトラフィックをホストネットワークへプロキシ） |
-| `--ping-interval D` | `60s` | WebSocket Ping送信間隔（30s〜300sの範囲） |
-| `--ping-pong-timeout D` | `15s` | Pong待機時間（超過で切断判定） |
-| `--backoff-base D` | `500ms` | 再接続の初期遅延 |
-| `--backoff-max D` | `60s` | 再接続遅延の上限 |
-| `--max-retries N` | `0` | 最大再接続回数（0 = 無制限） |
-
 ---
 
 ## 使用例
@@ -279,117 +212,93 @@ RIPWSクライアントを起動。WebSocketでサーバーに接続し、L3パ�
 最も基本的な構成。サーバー・クライアント両方でTUNデバイスを使用。`CAP_NET_ADMIN` と `/dev/net/tun` が必要。
 
 ```sh
-# --- サーバー側 ---
-sudo ripws server --listen :8080 --config creds.json --mode kernel
-# 起動後、TUNデバイスにアドレスを割り当てる:
-sudo ip addr add 10.7.0.1/24 dev tun0 && sudo ip link set up dev tun0
+# 認証情報生成
+ripws gen-config > creds.json
+UUID="$(jq -r 'keys[0]' creds.json)"
+PSK="$(jq -r ".[\"$UUID\"]" creds.json)"
 
-# --- クライアント側 ---
-sudo ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode kernel \
-    --ping-interval 30s
-# 起動後、TUNデバイスにアドレスを割り当てる:
-sudo ip addr add 10.7.0.2/24 dev tun0 && sudo ip link set up dev tun0
+# --- サーバー設定 (/etc/ripws/ws0.conf) ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.7.0.2/32
+EOF
+
+# --- クライアント設定 ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 30
+EOF
+
+# 起動
+sudo ripws up ws0.conf        # サーバー・クライアント両方で
 
 # 疎通確認
 ping -c 4 10.7.0.1   # クライアント→サーバー
 ping -c 4 10.7.0.2   # サーバー→クライアント
-```
 
-フラグで単一クライアントを直接指定することも可能:
-
-```sh
-sudo ripws server --listen :8080 --uuid <uuid> --psk <psk> --mode kernel
+# 停止
+sudo ripws down ws0.conf
 ```
 
 ---
 
 ### 2. ユーザースペースモード（権限不要）
 
-gVisor netstackを使用。root権限・TUNデバイス不要。サーバーとクライアント両方で利用可能。
+gVisor netstackを使用。root権限・TUNデバイス不要。
 
 ```sh
-# --- サーバー側（ユーザースペース + echoリスナー） ---
-ripws server \
-    --listen :8080 \
-    --uuid <uuid> --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.1 \
-    --us-echo 10.8.0.1:7
+# --- サーバー設定（カーネルモード、TUN使用） ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.8.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+Mode       = kernel
+MTU        = 1420
 
-# --- クライアント側（ユーザースペース） ---
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.8.0.2/32
+EOF
+sudo ripws up ws0.conf
+
+# --- クライアント設定（ユーザースペース、権限不要） ---
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.8.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 10.8.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf          # sudo不要
 ```
 
-> `--us-route` を `0.0.0.0/0`（デフォルト）にすると全トラフィックがトンネル経由になる。特定サブネットのみトンネルする場合は `--us-route 10.8.0.0/24` のように指定。
+> ユーザースペースモードでは `AllowedIPs` でgVisor netstack経由のCIDRを指定します。`0.0.0.0/0` で全トラフィック、`10.8.0.0/24` で特定サブネットのみトンネル。
 
 ---
 
-### 3. ユーザースペース ICMP Ping
-
-gVisorのICMPエンドポイントを使用して、トンネル経由でpingを送信。権限不要。
-
-```sh
-# サーバー（kernel TUN 10.8.0.1/24 で稼働中と仮定）
-
-# クライアント
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-ping 10.8.0.1 \
-    --us-ping-count 10 \
-    --us-ping-interval 1s
-```
-
-出力例:
-```
-client: PING 10.8.0.1 (10 probes, 1s interval)
-client: ping seq=0 rtt=689.324µs
-client: ping seq=1 rtt=451.212µs
-...
-client: ping 10.8.0.1: 10 sent, 10 recv, 0% loss, min=312µs avg=690µs max=1.08ms
-```
-
----
-
-### 4. ユーザースペース TCP/UDP ポートフォワード
-
-ローカルのリスナーポートを、トンネル先のアドレスにポートフォワード。iperf3等のツールをトンネル経由で利用可能。
-
-```sh
-# サーバー（kernel TUN 10.8.0.1/24, iperf3 -s -B 10.8.0.1 で稼働中と仮定）
-
-# クライアント — TCP + UDP フォワード
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-forward 127.0.0.1:5201=10.8.0.1:5201 \
-    --us-udp-forward 127.0.0.1:5201=10.8.0.1:5201 \
-    --us-ping 10.8.0.1 --us-ping-count 10
-
-# 別ターミナルから iperf3
-iperf3 -c 127.0.0.1 -p 5201 -t 10          # TCP c2s
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -R       # TCP s2c (reverse)
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -P 8     # TCP 8並列
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -u -b 200M   # UDP 200Mbps
-```
-
----
-
-### 5. ユーザースペース NATゲートウェイ
+### 3. ユーザースペース NATゲートウェイ
 
 クライアントをNATゲートウェイとして動作させ、サーバーからのトランジットトラフィックをクライアント経由でインターネットへ転送。クライアント側は権限不要。
 
@@ -397,20 +306,28 @@ iperf3 -c 127.0.0.1 -p 5201 -t 10 -u -b 200M   # UDP 200Mbps
 サーバー (kernel TUN 10.7.0.1/24)
     │  ip route add 1.1.1.1/32 8.8.8.8/32 via 10.7.0.2
     │  WebSocket ws://server:8080/<uuid>
-クライアント (userspace netstack 10.7.0.2, --us-nat)
+クライアント (userspace netstack 10.7.0.2, NAT = true)
     │  gVisor TCP/UDP Forwarder → net.Dial → インターネット
 インターネット (1.1.1.1, 8.8.8.8, ...)
 ```
 
 ```sh
-# --- クライアント（NATゲートウェイ、権限不要） ---
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.7.0.2 \
-    --us-route 10.7.0.0/24 \
-    --us-nat
+# --- クライアント設定（NATゲートウェイ、権限不要） ---
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+NAT        = true
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 10.7.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf
 
 # --- サーバー側（kernel TUN 10.7.0.1/24） ---
 # 外部IPへのルートをクライアント経由に設定
@@ -428,15 +345,14 @@ curl http://example.com/                      # TCP (DNS + HTTP)
 
 ---
 
-### 6. Cloudflare Tunnel経由 (wss://)
+### 4. Cloudflare Tunnel経由 (wss://)
 
 Cloudflare Tunnel (`cloudflared`) をリバースプロキシとして使用。`wss://` でTLS暗号化 + CDN透過。
 
 ```sh
 # --- サーバー（Dockerコンテナ、kernel TUN 10.7.0.1/24） ---
 # localhost:8080 をCloudflare Tunnelがリバースプロキシする構成
-sudo ripws server --listen :8080 --config creds.json --mode kernel
-sudo ip addr add 10.7.0.1/24 dev tun0 && sudo ip link set up dev tun0
+sudo ripws up ws0.conf
 # iperf3をトンネルIPにバインド
 iperf3 -s -p 5201 -B 10.7.0.1
 
@@ -445,95 +361,69 @@ cloudflared tunnel --no-autoupdate --protocol http2 run --token <CF_TOKEN>
 # ※ --protocol http2 必須（QUIC datagram handlerが一部環境で失敗するため）
 
 # --- クライアント（ホスト上、ユーザースペースモード） ---
-sudo ripws client \
-    --url "wss://ripws-test.example.com/<uuid>" \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.7.0.2 \
-    --us-route 10.7.0.0/24 \
-    --us-ping 10.7.0.1 --us-ping-count 100 --us-ping-interval 0.1s \
-    --us-forward 127.0.0.1:5201=10.7.0.1:5201 \
-    --us-udp-forward 127.0.0.1:5201=10.7.0.1:5201 \
-    --ping-interval 30s
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = wss://ripws-test.example.com/$UUID
+AllowedIPs = 10.7.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf
 
 # iperf3（Cloudflare経由）
-iperf3 -c 127.0.0.1 -p 5201 -t 15 -P 8       # TCP 8並列
-iperf3 -c 127.0.0.1 -p 5201 -t 15 -u -b 500M  # UDP 500Mbps
+iperf3 -c 10.7.0.1 -p 5201 -t 15 -P 8       # TCP 8並列
+iperf3 -c 10.7.0.1 -p 5201 -t 15 -u -b 500M  # UDP 500Mbps
 ```
 
-カーネルモードでのCloudflare経由も可能:
-
-```sh
-sudo ripws client \
-    --url "wss://ripws-test.example.com/<uuid>" \
-    --psk <psk> \
-    --mode kernel \
-    --ping-interval 30s
-sudo ip addr add 10.7.0.2/24 dev tun0 && sudo ip link set up dev tun0
-iperf3 -c 10.7.0.1 -p 5201 -B 10.7.0.2
-```
+カーネルモードでのCloudflare経由も可能 — クライアント設定で `Mode = kernel` を指定し、`ripws up` 後にTUNアドレスを手動割り当て。
 
 > **Silent Drop + Cloudflare:** 不正UUID/PSKのプローブはオリジンでRSTされるが、CloudflareはこれをHTTP 502としてクライアントに返す。オリジン自体はHTTPレスポンスを返さない。
 
 ---
 
-### 7. 複数クライアント（JSON設定ファイル）
+### 5. 複数クライアント（JSON設定ファイル）
+
+サーバーの `PrivateKey`（PSK）が全peerのデフォルト。peer個別の `PresharedKey` で異なるPSKを指定可能。
 
 ```sh
-# 複数のUUID-PSKペアをJSONファイルで管理
+# 複数のUUID-PSKペアを生成
 ripws gen-config > creds.json
 # creds.json に手動でエントリを追加:
 # {
 #   "uuid-a": "psk-a",
-#   "uuid-b": "psk-b",
-#   "uuid-c": "psk-c"
+#   "uuid-b": "psk-b"
 # }
 
-# サーバーは1つで複数クライアントを受け入れる
-sudo ripws server --listen :8080 --config creds.json --mode kernel
+# 複数peerを持つサーバー設定
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $DEFAULT_PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = uuid-a
+PresharedKey = psk-a
+AllowedIPs = 10.7.0.2/32
+
+[Peer]
+PublicKey  = uuid-b
+PresharedKey = psk-b
+AllowedIPs = 10.7.0.3/32
+EOF
+
+sudo ripws up ws0.conf
 
 # 各クライアントは自身のUUID/PSKで接続
-sudo ripws client --url ws://SERVER:8080/uuid-a --psk psk-a --mode kernel
-sudo ripws client --url ws://SERVER:8080/uuid-b --psk psk-b --mode kernel
-```
-
-`--config` と `--uuid`/`--psk` の併用も可能:
-
-```sh
-# JSONファイル + フラグ追加
-sudo ripws server --config creds.json --uuid <extra-uuid> --psk <extra-psk>
-```
-
----
-
-### 8. Echo プローブ（ユーザースペース疎通確認）
-
-サーバー側にgVisor内のTCP echoリスナーを起動し、クライアントから定期的にプローブ:
-
-```sh
-# サーバー（userspace, echoリスナー付き）
-ripws server \
-    --listen :8080 \
-    --uuid <uuid> --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.1 \
-    --us-echo 10.8.0.1:7
-
-# クライアント（userspace, 定期プローブ）
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-dial 10.8.0.1:7 \
-    --us-dial-interval 2s
-```
-
-出力例:
-```
-client: probe 10.8.0.1:7 OK rtt=1.2ms
-client: probe 10.8.0.1:7 OK rtt=0.9ms
+# クライアントA: Endpoint = ws://SERVER:8080/uuid-a, PrivateKey = psk-a
+# クライアントB: Endpoint = ws://SERVER:8080/uuid-b, PrivateKey = psk-b
 ```
 
 ---
@@ -543,11 +433,12 @@ client: probe 10.8.0.1:7 OK rtt=0.9ms
 | スクリプト | 内容 |
 |-----------|------|
 | `scripts/test.sh` | カーネルモード L3 ping + Silent Drop（Docker 2コンテナ） |
-| `scripts/test-userspace.sh` | ユーザースペース echo プーブ（両側gVisor） |
-| `scripts/test-us-direct.sh` | ユーザースペース直接接続ベンチマーク（client userspace + server kernel、iperf3 + ping） |
 | `scripts/test-nat.sh` | NATゲートウェイテスト（server→tunnel→client NAT→internet、TCP/UDP/DNS） |
+| `scripts/load-test.sh` | iperf3スループットベンチマーク（カーネルモード、Docker） |
+| `scripts/reconnect-test.sh` | 再接続 + KeepAliveロバスト性（サーバー再起動、ハードキル、アイドル） |
+| `scripts/multiport-test.sh` | マルチポート同時接続テスト（32 iperf3ストリーム） |
+| `scripts/cloudflare-test.sh` | Cloudflare経由カーネルモードE2E（ping + Silent Drop） |
 | `scripts/cloudflare-load-test.sh` | Cloudflare経由カーネルモード負荷テスト（iperf3 + 1000 ping） |
-| `scripts/cloudflare-us-test.sh` | Cloudflare経由ユーザースペーステスト（iperf3 + 100 ping） |
 
 ---
 
@@ -556,10 +447,10 @@ client: probe 10.8.0.1:7 OK rtt=0.9ms
 ### カーネルモード（L3 ping, Silent Drop）
 
 ```
-ripws-client (tun0 10.7.0.2/24)  --ws-->  ripws-server (tun0 10.7.0.1/24)
+ripws-client (ws0 10.7.0.2/24)  --ws-->  ripws-server (ws0 10.7.0.1/24)
 ```
 
-両コンテナとも `--cap-add=NET_ADMIN --device=/dev/net/tun` で実行。`scripts/entrypoint.sh` が `ripws` 起動後に `tun0` にアドレスを割り当てる。
+両コンテナとも `--cap-add=NET_ADMIN --device=/dev/net/tun` で実行。`scripts/entrypoint.sh` が環境変数からINI設定を生成し `ripws up` を実行。
 
 ```sh
 bash scripts/test.sh
@@ -567,31 +458,14 @@ bash scripts/test.sh
 
 期待結果: `ping -c 4 10.7.0.1`（クライアント→サーバー）と `ping -c 4 10.7.0.2`（サーバー→クライアント）が成功。不正UUID/PSKのプローブは `Connection reset by peer`（HTTPステータス行なし）。
 
-### ユーザースペース直接ベンチマーク
-
-```
-ripws-client (userspace 10.8.0.2)  --ws-->  ripws-server (tun0 10.8.0.1/24, iperf3 -B 10.8.0.1)
-```
-
-```sh
-bash scripts/test-us-direct.sh
-```
-
 ### NATゲートウェイ
 
 ```
-ripws-server (tun0 10.7.0.1/24) → tunnel → ripws-client (userspace 10.7.0.2, --us-nat) → internet
+ripws-server (ws0 10.7.0.1/24) → tunnel → ripws-client (userspace 10.7.0.2, NAT=true) → internet
 ```
 
 ```sh
 bash scripts/test-nat.sh
-```
-
-### Cloudflare経由
-
-```sh
-CF_TUNNEL_TOKEN=<token> bash scripts/cloudflare-load-test.sh    # kernel mode
-CF_TUNNEL_TOKEN=<token> bash scripts/cloudflare-us-test.sh      # userspace mode
 ```
 
 ### 手動Docker操作
@@ -625,19 +499,17 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## プロジェクトレイアウト
 
 ```
-main.go                      flagベース up/down/server/client/gen-* ディスパッチ
+main.go                      up/down/gen-psk/gen-config ディスパッチ
 flake.nix                    buildGoModule（静的バイナリ）
 internal/
   config/                    JSON + flag認証情報、PSKバリデーション (SPEC 2.2)
-    quickconf.go             wg-quick互換INIパーサー
+    quickconf.go             wg-quick互換INIパーサー（Mode, NATフィールド対応）
   proto/                     IPバージョンニブル、キープアライブ、指数バックオフ
   tunnel/
     tunnel.go                Interface 抽象契約
     tun_linux.go             kernel TUN バックエンド (songgao/water)
     netstack.go              gVisor userspace バックエンド (netstack)
     setup_linux.go           wg-quick風 ifup/ifdown (addr/MTU/routes/DNS/hooks)
-    ping.go                  userspace ICMP ping (gVisor ICMP endpoint)
-    forward.go               userspace TCP/UDP ポートフォワーダ
     nat.go                   userspace NATゲートウェイ (gVisor Forwarder → net.Dial)
   pipe/                      双方向 TUN↔WS プロキシ + バッファプール
   server/                    Silent Drop (hijack + SO_LINGER=0) + WS upgrade
@@ -663,14 +535,11 @@ Dockerfile, docker-compose*.yml
 
 | カテゴリ | 結果 |
 |----------|------|
-| L3接続性（kernel） | PASS |
+| L3接続性（カーネルモード） | PASS |
 | Silent Drop セキュリティ | PASS |
-| Userspace (gVisor) 基本 | PASS |
-| iperf3スループット（kernel） | PASS（1.6+ Gbps） |
+| Userspace NATゲートウェイ | PASS（TCP/UDP/DNS, tunnel → internet） |
+| iperf3スループット（kernel） | PASS（1.64 Gbps -P64） |
 | マルチポート同時接続 | PASS（32/32） |
 | 再接続・KeepAlive | PASS |
-| レース検出器 | PASS |
+| レース検出器・ユニットテスト | PASS |
 | Cloudflare tunnel（kernel） | PASS（wss://, 双方向, RTT ~232ms） |
-| Userspace ping + iperf（直接） | PASS（0% loss, 2.0 Gbps -P8） |
-| Userspace NATゲートウェイ | PASS（TCP/UDP/DNS, tunnel → internet） |
-| Cloudflare tunnel（userspace） | PASS（wss://, 0% ping loss, UDP 499 Mbps 0% loss） |

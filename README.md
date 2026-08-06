@@ -5,23 +5,23 @@
 A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 [`SPEC.md`](SPEC.md)): raw L3 packets tunneled over a WebSocket binary stream.
 
-- Single binary with `up` / `down` / `server` / `client` / `gen-psk` / `gen-config` subcommands.
+- Single binary with `up` / `down` / `gen-psk` / `gen-config` subcommands.
 - **wg-quick-compatible configuration** — `ripws up ws0.conf` automatically creates the TUN device, assigns addresses, configures MTU, routes, DNS, and runs PreUp/PostUp hooks.
 - **Silent Drop** — unknown UUID or bad PSK ⇒ immediate TCP RST
   (`SO_LINGER=0`), no HTTP response.
 - Two L3 backends behind one `tunnel.Interface`:
   - `kernel` — host TUN device (`songgao/water`), requires `CAP_NET_ADMIN` +
-    `/dev/net/tun`.
-  - `userspace` — in-process gVisor netstack, **no privileges, no TUN**.
+    `/dev/net/tun`. (wg-quick-respect)
+  - `userspace` — in-process gVisor netstack, **no privileges, no TUN**. (Tailscale-respect)
+- **Userspace NAT gateway** — transit traffic from the tunnel is transparently
+  proxied out through the host's kernel networking via `net.Dial`. No
+  `CAP_NET_ADMIN` required.
 - Bidirectional goroutine proxy pipe (`TUN ↔ WS`) with a `sync.Pool` byte
   buffer, IP-version nibble validation, and graceful packet-drop on transient
   TUN write faults.
 - WebSocket Ping/Pong keep-alive with a jittered, spec-compliant 30–300 s
   client interval and a server read-window ≥ slowest legal ping.
 - Exponential backoff reconnection with full jitter.
-- **Userspace NAT gateway** — transit traffic from the tunnel is transparently
-  proxied out through the host's kernel networking via `net.Dial`. No
-  `CAP_NET_ADMIN` required.
 
 ---
 
@@ -29,21 +29,16 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 
 - [Build](#build)
 - [Subcommand Overview](#subcommand-overview)
-- [Quick Start (wg-quick style)](#quick-start-wg-quick-style)
-- [wg-quick-compatible Config File](#wg-quick-compatible-config-file)
+- [Quick Start](#quick-start)
+- [Config File Format](#config-file-format)
 - [gen-psk](#gen-psk)
 - [gen-config](#gen-config)
-- [server](#server)
-- [client](#client)
 - [Usage Examples](#usage-examples)
   - [1. Kernel Mode (Basic Tunnel)](#1-kernel-mode-basic-tunnel)
   - [2. Userspace Mode (No Privileges)](#2-userspace-mode-no-privileges)
-  - [3. Userspace ICMP Ping](#3-userspace-icmp-ping)
-  - [4. Userspace TCP/UDP Port Forward](#4-userspace-tcpudp-port-forward)
-  - [5. Userspace NAT Gateway](#5-userspace-nat-gateway)
-  - [6. Cloudflare Tunnel (wss://)](#6-cloudflare-tunnel-wss)
-  - [7. Multiple Clients (JSON Config File)](#7-multiple-clients-json-config-file)
-  - [8. Echo Probe (Userspace Connectivity Check)](#8-echo-probe-userspace-connectivity-check)
+  - [3. Userspace NAT Gateway](#3-userspace-nat-gateway)
+  - [4. Cloudflare Tunnel (wss://)](#4-cloudflare-tunnel-wss)
+  - [5. Multiple Clients (JSON Config File)](#5-multiple-clients-json-config-file)
 - [Test Scripts](#test-scripts)
 - [Docker Tests](#docker-tests)
 - [Project Layout](#project-layout)
@@ -64,13 +59,13 @@ nix develop                # shell with go / gopls for hacking
 `flake.nix` uses `buildGoModule`; the gVisor/netstack version is pinned in
 `go.mod`.
 
-> **Note:** Nix flake builds from Git-tracked source — new files must be
-> `git add`ed before `nix build`.
+> **Note:** Nix flake builds from Git-tracked source — changes must be
+> committed before `nix build` picks them up.
 
 ### Build with Go directly
 
 ```sh
-go build -o ripws .
+CGO_ENABLED=0 go build -o ripws .
 ```
 
 ---
@@ -78,22 +73,20 @@ go build -o ripws .
 ## Subcommand Overview
 
 ```
-ripws up   <config.conf>  Bring up a tunnel wg-quick-style (TUN creation, addr, MTU, routes, DNS, hooks)
-ripws down <config.conf>  Tear down a tunnel (remove interface, restore DNS, hooks)
-ripws server   [flags]    Start the RIPWS server (manual interface setup)
-ripws client   [flags]    Start the RIPWS client (manual interface setup)
-ripws gen-psk               Generate a fresh 32-byte Base64 PSK
-ripws gen-config            Generate JSON mapping a fresh UUID to a fresh PSK
-ripws help                  Show help
+ripws up   <config.conf>  Bring up a tunnel (TUN/netstack creation, addr, MTU, routes, DNS, hooks)
+ripws down <iface|conf>   Tear down a running tunnel (SIGTERM + cleanup)
+ripws gen-psk             Generate a fresh 32-byte Base64 PSK
+ripws gen-config          Generate JSON mapping a fresh UUID to a fresh PSK
+ripws help                Show help
 ```
 
 ---
 
-## Quick Start (wg-quick style)
+## Quick Start
 
 `ripws up` / `ripws down` use a wg-quick-compatible INI config file to fully
-automate TUN creation, address assignment, MTU, route addition, DNS injection,
-and PreUp/PostUp hooks. Requires `CAP_NET_ADMIN`.
+automate interface creation, address assignment, MTU, route addition, DNS
+injection, and PreUp/PostUp hooks.
 
 ```sh
 # Generate credentials
@@ -140,7 +133,7 @@ sudo ripws down /tmp/ws0.conf
 
 ---
 
-## wg-quick-compatible Config File
+## Config File Format
 
 Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 
@@ -152,6 +145,8 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 | `ListenPort` | server only | Server listen port. When present, runs in server mode |
 | `PrivateKey` | ✓ | Default PSK (base64, 44 chars). Overridden per-peer by `PresharedKey` |
 | `MTU` | (default 1420) | Interface MTU |
+| `Mode` | (default `kernel`) | `kernel` (TUN, requires CAP_NET_ADMIN) or `userspace` (gVisor netstack, no privileges) |
+| `NAT` | (default `false`) | Userspace only: enable NAT gateway (tunnel transit → host networking) |
 | `DNS` | (optional) | DNS server(s) injected into `/etc/resolv.conf` (comma-separated) |
 | `Table` | (default `auto`) | `off` skips route addition |
 | `PreUp` | (optional) | Shell command(s) to run before interface comes up (multiple lines allowed) |
@@ -187,6 +182,11 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 - `ListenPort` present → **server** (starts HTTP server)
 - `ListenPort` absent → **client** (connects to first `[Peer]`'s `Endpoint`)
 
+### Kernel vs Userspace Mode
+
+- `Mode = kernel` (default) → uses host TUN device, requires `CAP_NET_ADMIN` + `/dev/net/tun`
+- `Mode = userspace` → uses in-process gVisor netstack, no privileges needed
+
 ### Interface Name Derivation
 
 The interface name is derived from the config file's basename minus `.conf`:
@@ -205,8 +205,6 @@ ripws gen-psk
 # Example output: 8x/P9mZ3qF1bR6wN2vT4xK7jL0sH5aBcDeFgHiJk=
 ```
 
-Options: none
-
 ---
 
 ## gen-config
@@ -222,75 +220,6 @@ ripws gen-config
 # }
 ```
 
-Options: none
-
----
-
-## server
-
-Starts the RIPWS server. After WebSocket upgrade, it acts as an L3 packet
-tunnel endpoint.
-
-### Flag Reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--listen ADDR` | `:8080` | Listen address |
-| `--config PATH` | (empty) | JSON file mapping UUID → PSK (multi-client support) |
-| `--uuid UUID` | (empty) | Single-client UUID (can be combined with `--config`) |
-| `--psk PSK` | (empty) | Single-client PSK |
-| `--mode kernel\|userspace` | `kernel` | L3 backend selection |
-| `--tun-name NAME` | (empty) | kernel: desired TUN name hint (best effort) |
-| `--us-addr IP[,IP...]` | (empty) | userspace: virtual IPs assigned to the netstack NIC (comma-separated) |
-| `--us-route CIDR[,CIDR..]` | `0.0.0.0/0,::/0` | userspace: routes via the tunnel NIC (comma-separated CIDRs) |
-| `--us-echo ADDR` | (empty) | userspace: start a TCP echo listener inside the netstack (e.g. `10.8.0.1:7`) |
-| `--ping-window D` | `330s` | Read-deadline window for reaping dead clients (≥ slowest client ping 300s) |
-
-> `--config` and `--uuid`/`--psk` can be combined. When both are specified, the
-> flag credentials are merged in. At least one credential is required.
-
-### Config File Format
-
-```json
-{
-  "client-a-uuid": "client-a-psk-base64",
-  "client-b-uuid": "client-b-psk-base64"
-}
-```
-
----
-
-## client
-
-Starts the RIPWS client. Connects to the server via WebSocket and bridges L3
-packets bidirectionally. On disconnect, reconnects with exponential backoff +
-jitter.
-
-### Flag Reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--url URL` | (required) | `ws(s)://host:port/<uuid>` endpoint |
-| `--psk PSK` | (required) | Pre-Shared Key (Bearer token) |
-| `--mode kernel\|userspace` | `kernel` | L3 backend selection |
-| `--tun-name NAME` | (empty) | kernel: TUN name hint |
-| `--tun-addr ADDR` | (empty) | kernel: informational; address to assign to the TUN device (printed at startup) |
-| `--us-addr IP[,IP...]` | (empty) | userspace: local virtual IP(s) (comma-separated) |
-| `--us-route CIDR[,CIDR..]` | `0.0.0.0/0,::/0` | userspace: routes via tunnel NIC |
-| `--us-dial ADDR` | (empty) | userspace: one-shot echo probe target (e.g. `10.8.0.1:7`) |
-| `--us-dial-interval D` | `5s` | echo probe repeat interval |
-| `--us-ping IP` | (empty) | userspace: ICMP ping destination IP (e.g. `10.8.0.1`) |
-| `--us-ping-count N` | `4` | number of ping probes |
-| `--us-ping-interval D` | `1s` | interval between ping probes |
-| `--us-forward L=R` | (empty) | userspace: TCP port forward `LOCAL=REMOTE` (e.g. `127.0.0.1:5201=10.8.0.1:5201`) |
-| `--us-udp-forward L=R` | (empty) | userspace: UDP port forward `LOCAL=REMOTE` |
-| `--us-nat` | `false` | userspace: enable NAT gateway (tunnel transit traffic proxied out via host networking) |
-| `--ping-interval D` | `60s` | WebSocket Ping interval (must be within 30s–300s) |
-| `--ping-pong-timeout D` | `15s` | Pong wait before declaring connection dead |
-| `--backoff-base D` | `500ms` | initial reconnect delay |
-| `--backoff-max D` | `60s` | reconnect delay cap |
-| `--max-retries N` | `0` | max reconnect attempts (0 = unlimited) |
-
 ---
 
 ## Usage Examples
@@ -301,122 +230,95 @@ The most basic configuration. Both server and client use TUN devices. Requires
 `CAP_NET_ADMIN` and `/dev/net/tun`.
 
 ```sh
-# --- Server ---
-sudo ripws server --listen :8080 --config creds.json --mode kernel
-# After startup, assign an address to the TUN device:
-sudo ip addr add 10.7.0.1/24 dev tun0 && sudo ip link set up dev tun0
+# Generate credentials
+ripws gen-config > creds.json
+UUID="$(jq -r 'keys[0]' creds.json)"
+PSK="$(jq -r ".[\"$UUID\"]" creds.json)"
 
-# --- Client ---
-sudo ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode kernel \
-    --ping-interval 30s
-# After startup, assign an address to the TUN device:
-sudo ip addr add 10.7.0.2/24 dev tun0 && sudo ip link set up dev tun0
+# --- Server config (/etc/ripws/ws0.conf) ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.7.0.2/32
+EOF
+
+# --- Client config ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 30
+EOF
+
+# Bring up
+sudo ripws up ws0.conf        # on both server and client
 
 # Verify connectivity
 ping -c 4 10.7.0.1   # client → server
 ping -c 4 10.7.0.2   # server → client
-```
 
-You can also specify a single client directly via flags:
-
-```sh
-sudo ripws server --listen :8080 --uuid <uuid> --psk <psk> --mode kernel
+# Bring down
+sudo ripws down ws0.conf
 ```
 
 ---
 
 ### 2. Userspace Mode (No Privileges)
 
-Uses gVisor netstack. No root, no TUN device required. Available on both server
-and client.
+Uses gVisor netstack. No root, no TUN device required.
 
 ```sh
-# --- Server (userspace + echo listener) ---
-ripws server \
-    --listen :8080 \
-    --uuid <uuid> --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.1 \
-    --us-echo 10.8.0.1:7
+# --- Server config (kernel mode, with TUN) ---
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.8.0.1/24
+ListenPort = 8080
+PrivateKey = $PSK
+Mode       = kernel
+MTU        = 1420
 
-# --- Client (userspace) ---
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24
+[Peer]
+PublicKey  = $UUID
+AllowedIPs = 10.8.0.2/32
+EOF
+sudo ripws up ws0.conf
+
+# --- Client config (userspace, no privileges) ---
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.8.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 10.8.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf          # no sudo needed
 ```
 
-> Setting `--us-route` to `0.0.0.0/0` (the default) routes all traffic through
-> the tunnel. To tunnel only a specific subnet, specify e.g.
-> `--us-route 10.8.0.0/24`.
+> In userspace mode, `AllowedIPs` controls which CIDRs are routed through the
+> gVisor netstack. Use `0.0.0.0/0` for full-tunnel or a specific subnet like
+> `10.8.0.0/24`.
 
 ---
 
-### 3. Userspace ICMP Ping
-
-Uses gVisor's ICMP endpoint to send pings through the tunnel. No privileges
-required.
-
-```sh
-# Server (assuming kernel TUN 10.8.0.1/24 is running)
-
-# Client
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-ping 10.8.0.1 \
-    --us-ping-count 10 \
-    --us-ping-interval 1s
-```
-
-Example output:
-```
-client: PING 10.8.0.1 (10 probes, 1s interval)
-client: ping seq=0 rtt=689.324µs
-client: ping seq=1 rtt=451.212µs
-...
-client: ping 10.8.0.1: 10 sent, 10 recv, 0% loss, min=312µs avg=690µs max=1.08ms
-```
-
----
-
-### 4. Userspace TCP/UDP Port Forward
-
-Forwards a local listener port to a remote address through the tunnel. Allows
-tools like iperf3 to be used over the tunnel.
-
-```sh
-# Server (assuming kernel TUN 10.8.0.1/24, iperf3 -s -B 10.8.0.1 is running)
-
-# Client — TCP + UDP forward
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-forward 127.0.0.1:5201=10.8.0.1:5201 \
-    --us-udp-forward 127.0.0.1:5201=10.8.0.1:5201 \
-    --us-ping 10.8.0.1 --us-ping-count 10
-
-# From another terminal, run iperf3
-iperf3 -c 127.0.0.1 -p 5201 -t 10          # TCP c2s
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -R       # TCP s2c (reverse)
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -P 8     # TCP 8 parallel
-iperf3 -c 127.0.0.1 -p 5201 -t 10 -u -b 200M   # UDP 200Mbps
-```
-
----
-
-### 5. Userspace NAT Gateway
+### 3. Userspace NAT Gateway
 
 Runs the client as a NAT gateway, forwarding transit traffic from the server to
 the internet via the client. No privileges required on the client side.
@@ -425,20 +327,28 @@ the internet via the client. No privileges required on the client side.
 Server (kernel TUN 10.7.0.1/24)
     │  ip route add 1.1.1.1/32 8.8.8.8/32 via 10.7.0.2
     │  WebSocket ws://server:8080/<uuid>
-Client (userspace netstack 10.7.0.2, --us-nat)
+Client (userspace netstack 10.7.0.2, NAT = true)
     │  gVisor TCP/UDP Forwarder → net.Dial → Internet
 Internet (1.1.1.1, 8.8.8.8, ...)
 ```
 
 ```sh
-# --- Client (NAT gateway, no privileges) ---
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.7.0.2 \
-    --us-route 10.7.0.0/24 \
-    --us-nat
+# --- Client config (NAT gateway, no privileges) ---
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+NAT        = true
+MTU        = 1420
+
+[Peer]
+PublicKey  = $UUID
+Endpoint   = ws://SERVER:8080/$UUID
+AllowedIPs = 10.7.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf
 
 # --- Server (kernel TUN 10.7.0.1/24) ---
 # Route external IPs via the client
@@ -458,7 +368,7 @@ curl http://example.com/                      # TCP (DNS + HTTP)
 
 ---
 
-### 6. Cloudflare Tunnel (wss://)
+### 4. Cloudflare Tunnel (wss://)
 
 Uses Cloudflare Tunnel (`cloudflared`) as a reverse proxy. TLS encryption + CDN
 traversal via `wss://`.
@@ -466,8 +376,7 @@ traversal via `wss://`.
 ```sh
 # --- Server (Docker container, kernel TUN 10.7.0.1/24) ---
 # Cloudflare Tunnel reverse-proxies localhost:8080
-sudo ripws server --listen :8080 --config creds.json --mode kernel
-sudo ip addr add 10.7.0.1/24 dev tun0 && sudo ip link set up dev tun0
+sudo ripws up ws0.conf
 # Bind iperf3 to the tunnel IP
 iperf3 -s -p 5201 -B 10.7.0.1
 
@@ -476,33 +385,28 @@ cloudflared tunnel --no-autoupdate --protocol http2 run --token <CF_TOKEN>
 # --protocol http2 is required (QUIC datagram handler fails in some environments)
 
 # --- Client (on host, userspace mode) ---
-sudo ripws client \
-    --url "wss://ripws-test.example.com/<uuid>" \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.7.0.2 \
-    --us-route 10.7.0.0/24 \
-    --us-ping 10.7.0.1 --us-ping-count 100 --us-ping-interval 0.1s \
-    --us-forward 127.0.0.1:5201=10.7.0.1:5201 \
-    --us-udp-forward 127.0.0.1:5201=10.7.0.1:5201 \
-    --ping-interval 30s
+cat > ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = userspace
+MTU        = 1420
 
-# iperf3 (through Cloudflare)
-iperf3 -c 127.0.0.1 -p 5201 -t 15 -P 8       # TCP 8 parallel
-iperf3 -c 127.0.0.1 -p 5201 -t 15 -u -b 500M  # UDP 500Mbps
+[Peer]
+PublicKey  = $UUID
+Endpoint   = wss://ripws-test.example.com/$UUID
+AllowedIPs = 10.7.0.0/24
+PersistentKeepalive = 30
+EOF
+ripws up ws0.conf
+
+# iperf3 (through Cloudflare, if port-forward is set up)
+iperf3 -c 10.7.0.1 -p 5201 -t 15 -P 8       # TCP 8 parallel
+iperf3 -c 10.7.0.1 -p 5201 -t 15 -u -b 500M  # UDP 500Mbps
 ```
 
-Kernel mode through Cloudflare also works:
-
-```sh
-sudo ripws client \
-    --url "wss://ripws-test.example.com/<uuid>" \
-    --psk <psk> \
-    --mode kernel \
-    --ping-interval 30s
-sudo ip addr add 10.7.0.2/24 dev tun0 && sudo ip link set up dev tun0
-iperf3 -c 10.7.0.1 -p 5201 -B 10.7.0.2
-```
+Kernel mode through Cloudflare also works — just use `Mode = kernel` in the
+client config and assign the TUN address manually after `ripws up`.
 
 > **Silent Drop + Cloudflare:** Probes with bad UUID/PSK are RST'd at the
 > origin, but Cloudflare translates this to HTTP 502 for the client. The origin
@@ -510,64 +414,44 @@ iperf3 -c 10.7.0.1 -p 5201 -B 10.7.0.2
 
 ---
 
-### 7. Multiple Clients (JSON Config File)
+### 5. Multiple Clients (JSON Config File)
+
+The server's `PrivateKey` (PSK) is the default for all peers. Per-peer
+`PresharedKey` overrides allow different PSKs per client.
 
 ```sh
-# Manage multiple UUID-PSK pairs in a JSON file
+# Generate multiple UUID-PSK pairs
 ripws gen-config > creds.json
-# Manually add entries to creds.json:
+# Manually add entries:
 # {
 #   "uuid-a": "psk-a",
-#   "uuid-b": "psk-b",
-#   "uuid-c": "psk-c"
+#   "uuid-b": "psk-b"
 # }
 
-# One server accepts multiple clients
-sudo ripws server --listen :8080 --config creds.json --mode kernel
+# Server config with multiple peers
+cat > /etc/ripws/ws0.conf << EOF
+[Interface]
+Address    = 10.7.0.1/24
+ListenPort = 8080
+PrivateKey = $DEFAULT_PSK
+MTU        = 1420
+
+[Peer]
+PublicKey  = uuid-a
+PresharedKey = psk-a
+AllowedIPs = 10.7.0.2/32
+
+[Peer]
+PublicKey  = uuid-b
+PresharedKey = psk-b
+AllowedIPs = 10.7.0.3/32
+EOF
+
+sudo ripws up ws0.conf
 
 # Each client connects with its own UUID/PSK
-sudo ripws client --url ws://SERVER:8080/uuid-a --psk psk-a --mode kernel
-sudo ripws client --url ws://SERVER:8080/uuid-b --psk psk-b --mode kernel
-```
-
-Combining `--config` with `--uuid`/`--psk`:
-
-```sh
-# JSON file + additional flag credential
-sudo ripws server --config creds.json --uuid <extra-uuid> --psk <extra-psk>
-```
-
----
-
-### 8. Echo Probe (Userspace Connectivity Check)
-
-Starts a TCP echo listener inside the server's gVisor netstack and probes it
-periodically from the client:
-
-```sh
-# Server (userspace, with echo listener)
-ripws server \
-    --listen :8080 \
-    --uuid <uuid> --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.1 \
-    --us-echo 10.8.0.1:7
-
-# Client (userspace, periodic probe)
-ripws client \
-    --url ws://SERVER:8080/<uuid> \
-    --psk <psk> \
-    --mode userspace \
-    --us-addr 10.8.0.2 \
-    --us-route 10.8.0.0/24 \
-    --us-dial 10.8.0.1:7 \
-    --us-dial-interval 2s
-```
-
-Example output:
-```
-client: probe 10.8.0.1:7 OK rtt=1.2ms
-client: probe 10.8.0.1:7 OK rtt=0.9ms
+# Client A: Endpoint = ws://SERVER:8080/uuid-a, PrivateKey = psk-a
+# Client B: Endpoint = ws://SERVER:8080/uuid-b, PrivateKey = psk-b
 ```
 
 ---
@@ -577,11 +461,12 @@ client: probe 10.8.0.1:7 OK rtt=0.9ms
 | Script | Description |
 |--------|-------------|
 | `scripts/test.sh` | Kernel mode L3 ping + Silent Drop (Docker, 2 containers) |
-| `scripts/test-userspace.sh` | Userspace echo probe (both sides gVisor) |
-| `scripts/test-us-direct.sh` | Userspace direct benchmark (client userspace + server kernel, iperf3 + ping) |
 | `scripts/test-nat.sh` | NAT gateway test (server → tunnel → client NAT → internet, TCP/UDP/DNS) |
+| `scripts/load-test.sh` | iperf3 throughput benchmark (kernel mode, Docker) |
+| `scripts/reconnect-test.sh` | Reconnection + KeepAlive robustness (server restart, hard kill, idle) |
+| `scripts/multiport-test.sh` | Multi-port concurrent connection test (32 iperf3 streams) |
+| `scripts/cloudflare-test.sh` | Cloudflare kernel mode E2E (ping + Silent Drop) |
 | `scripts/cloudflare-load-test.sh` | Cloudflare kernel mode load test (iperf3 + 1000 pings) |
-| `scripts/cloudflare-us-test.sh` | Cloudflare userspace test (iperf3 + 100 pings) |
 
 ---
 
@@ -590,12 +475,12 @@ client: probe 10.8.0.1:7 OK rtt=0.9ms
 ### Kernel Mode (L3 ping, Silent Drop)
 
 ```
-ripws-client (tun0 10.7.0.2/24)  --ws-->  ripws-server (tun0 10.7.0.1/24)
+ripws-client (ws0 10.7.0.2/24)  --ws-->  ripws-server (ws0 10.7.0.1/24)
 ```
 
 Both containers run with `--cap-add=NET_ADMIN --device=/dev/net/tun`. The
-entrypoint (`scripts/entrypoint.sh`) starts `ripws`, waits for `tun0`, then
-assigns the address and brings the link up.
+entrypoint (`scripts/entrypoint.sh`) generates an INI config from environment
+variables and runs `ripws up`.
 
 ```sh
 bash scripts/test.sh
@@ -605,31 +490,14 @@ Expected: `ping -c 4 10.7.0.1` (client→server) and `ping -c 4 10.7.0.2`
 (server→client) both succeed; a probe with bad UUID/PSK yields
 `Connection reset by peer` with **no HTTP status line** (Silent Drop).
 
-### Userspace Direct Benchmark
-
-```
-ripws-client (userspace 10.8.0.2)  --ws-->  ripws-server (tun0 10.8.0.1/24, iperf3 -B 10.8.0.1)
-```
-
-```sh
-bash scripts/test-us-direct.sh
-```
-
 ### NAT Gateway
 
 ```
-ripws-server (tun0 10.7.0.1/24) → tunnel → ripws-client (userspace 10.7.0.2, --us-nat) → internet
+ripws-server (ws0 10.7.0.1/24) → tunnel → ripws-client (userspace 10.7.0.2, NAT=true) → internet
 ```
 
 ```sh
 bash scripts/test-nat.sh
-```
-
-### Cloudflare
-
-```sh
-CF_TUNNEL_TOKEN=<token> bash scripts/cloudflare-load-test.sh    # kernel mode
-CF_TUNNEL_TOKEN=<token> bash scripts/cloudflare-us-test.sh      # userspace mode
 ```
 
 ### Manual Docker Commands
@@ -663,19 +531,17 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 ## Project Layout
 
 ```
-main.go                      flag-based up/down/server/client/gen-* dispatch
+main.go                      up/down/gen-psk/gen-config dispatch
 flake.nix                    buildGoModule (static binary)
 internal/
   config/                    JSON + flag credentials, PSK validation (SPEC 2.2)
-    quickconf.go             wg-quick-compatible INI parser
+    quickconf.go             wg-quick-compatible INI parser (Mode, NAT fields)
   proto/                     IP-version nibble, keep-alive, exponential backoff
   tunnel/
     tunnel.go                Interface abstract contract
     tun_linux.go             kernel TUN backend (songgao/water)
     netstack.go              gVisor userspace backend (netstack)
     setup_linux.go           wg-quick-style ifup/ifdown (addr/MTU/routes/DNS/hooks)
-    ping.go                  userspace ICMP ping (gVisor ICMP endpoint)
-    forward.go               userspace TCP/UDP port forwarder
     nat.go                   userspace NAT gateway (gVisor Forwarder → net.Dial)
   pipe/                      bidirectional TUN↔WS proxy + buffer pool
   server/                    Silent Drop (hijack + SO_LINGER=0) + WS upgrade
@@ -702,14 +568,11 @@ See [`REPORT.md`](REPORT.md) for full test results.
 
 | Category | Result |
 |----------|--------|
-| L3 connectivity (kernel) | PASS |
+| L3 connectivity (kernel mode) | PASS |
 | Silent Drop security | PASS |
-| Userspace (gVisor) basic | PASS |
-| iperf3 throughput (kernel) | PASS (1.6+ Gbps) |
+| Userspace NAT gateway | PASS (TCP/UDP/DNS, tunnel → internet) |
+| iperf3 throughput (kernel) | PASS (1.64 Gbps -P64) |
 | Multi-port concurrency | PASS (32/32) |
 | Reconnection & KeepAlive | PASS |
-| Race detector | PASS |
+| Race detector & unit tests | PASS |
 | Cloudflare tunnel (kernel) | PASS (wss://, bidirectional, RTT ~232ms) |
-| Userspace ping + iperf (direct) | PASS (0% loss, 2.0 Gbps -P8) |
-| Userspace NAT gateway | PASS (TCP/UDP/DNS, tunnel → internet) |
-| Cloudflare tunnel (userspace) | PASS (wss://, 0% ping loss, UDP 499 Mbps 0% loss) |
