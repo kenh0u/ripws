@@ -11,7 +11,8 @@
 /*.out
 /coverage.txt
 
-# Credentials & runtime config (contains UUID→PSK map)
+# Credentials & runtime config (contains UUID/PSK)
+/config/creds.env
 /config/server.json
 /cfg/
 
