@@ -4,6 +4,7 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -46,6 +47,28 @@ func (t *tunKernel) ReadPacket(p []byte) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ReadPacketCtx blocks on the TUN fd in a dedicated goroutine so a cancelled
+// ctx can unblock the caller (a raw fd read cannot be interrupted directly).
+// The goroutine exits as soon as the pending read completes; the fd is owned
+// by the interface, which outlives any single session.
+func (t *tunKernel) ReadPacketCtx(ctx context.Context, p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := t.ifce.Read(p)
+		ch <- result{n, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.n, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
 func (t *tunKernel) WritePacket(p []byte) (int, error) {

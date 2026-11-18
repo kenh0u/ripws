@@ -98,7 +98,7 @@ func Run(ctx context.Context, t tunnel.Interface, conn *websocket.Conn, opts Opt
 		buf := getBuf()
 		defer putBuf(buf)
 		for {
-			n, err := t.ReadPacket(buf)
+			n, err := t.ReadPacketCtx(subCtx, buf)
 			if err != nil {
 				fail("tun-read", err)
 				return
@@ -106,6 +106,9 @@ func Run(ctx context.Context, t tunnel.Interface, conn *websocket.Conn, opts Opt
 			if _, vErr := proto.IPVersion(buf[:n]); vErr != nil {
 				continue // drop malformed packet silently
 			}
+			// Bound each write so a black-holed peer cannot pin the writer
+			// indefinitely; the read deadline is the ultimate liveness check.
+			_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if err := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 				fail("ws-write", err)
 				return

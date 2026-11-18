@@ -7,6 +7,8 @@
 // userspace-networking separation between wire transport and L3 handling.
 package tunnel
 
+import "context"
+
 // Interface is a bidirectional raw-IP packet conduit.
 //
 // Implementations must be safe for a single reader and a single writer
@@ -17,6 +19,12 @@ type Interface interface {
 	// network stack) into p and returns its length. It blocks until a packet
 	// is available or the interface is closed.
 	ReadPacket(p []byte) (n int, err error)
+
+	// ReadPacketCtx is ReadPacket with cancellation: when ctx is done it
+	// unblocks and returns ctx.Err(). The pipe layer requires this so a dead
+	// WebSocket session cannot leave a reader goroutine blocked inside the
+	// interface forever.
+	ReadPacketCtx(ctx context.Context, p []byte) (n int, err error)
 
 	// WritePacket writes a single outbound IP packet (received from the
 	// remote peer over the WebSocket) into the local network stack.
