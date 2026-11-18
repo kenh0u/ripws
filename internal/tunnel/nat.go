@@ -17,8 +17,12 @@ import (
 )
 
 // bridge copies data bidirectionally between two connections until one side
-// closes, then closes both.
+// closes, then closes both so no goroutine or socket lingers after the flow
+// is gone.
 func bridge(a, b net.Conn) {
+	defer a.Close()
+	defer b.Close()
+
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(b, a)
@@ -72,6 +76,10 @@ func (u *Userspace) EnableNAT(logger *log.Logger) error {
 			r.Complete(true)
 			return
 		}
+		// Complete without a RST: the endpoint now owns the connection and
+		// the forwarder must release its in-flight bookkeeping, otherwise the
+		// request leaks one segment + map entry per connection.
+		r.Complete(false)
 
 		localConn := gonet.NewTCPConn(&wq, ep)
 		if logger != nil {
@@ -129,16 +137,23 @@ func (u *Userspace) EnableNAT(logger *log.Logger) error {
 	return nil
 }
 
+// udpIdleTimeout bounds how long an idle UDP flow is kept alive. UDP has no
+// natural end-of-flow signal, so without a timeout every DNS query etc.
+// would pin two goroutines and two sockets forever.
+const udpIdleTimeout = 60 * time.Second
+
 // udpBridge copies data bidirectionally between a netstack UDP conn and a
 // kernel UDP conn. It uses ReadFrom/WriteTo on the kernel side to preserve the
 // remote address. The netstack side is connection-oriented (connected to the
-// original source).
+// original source). The bridge is reaped after udpIdleTimeout of silence.
 func udpBridge(local *gonet.UDPConn, remote net.Conn) {
 	defer local.Close()
 	defer remote.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	done := make(chan struct{}, 2)
 
 	// netstack -> kernel
 	go func() {
@@ -152,6 +167,7 @@ func udpBridge(local *gonet.UDPConn, remote net.Conn) {
 			if _, err := remote.Write(buf[:n]); err != nil {
 				return
 			}
+			done <- struct{}{}
 		}
 	}()
 
@@ -167,8 +183,23 @@ func udpBridge(local *gonet.UDPConn, remote net.Conn) {
 			if _, err := local.Write(buf[:n]); err != nil {
 				return
 			}
+			done <- struct{}{}
 		}
 	}()
 
-	wg.Wait()
+	timer := time.NewTimer(udpIdleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			timer.Reset(udpIdleTimeout)
+		case <-timer.C:
+			// Idle too long: close both conns; the goroutines above exit on
+			// the resulting read errors and wg.Wait below returns.
+			local.Close()
+			remote.Close()
+			wg.Wait()
+			return
+		}
+	}
 }
