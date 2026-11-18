@@ -13,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -45,17 +47,17 @@ type Config struct {
 
 // newDialer builds the WebSocket dialer for target u. Proxy support is a
 // core design point — RIPWS must pierce environments where the only way
-// out is an HTTP proxy — so we default to the standard environment
-// (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) resolution, including the ws->http and
-// wss->https scheme mapping.
+// out is a proxy — so we resolve HTTP(S)_PROXY (via CONNECT, with ws->http
+// and wss->https scheme mapping) and ALL_PROXY (socks5, honoring NO_PROXY)
+// from the environment.
 func newDialer(u *url.URL) *websocket.Dialer {
 	return &websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 		ReadBufferSize:   tunnel.MTU,
 		WriteBufferSize:  tunnel.MTU,
 		Proxy: func(r *http.Request) (*url.URL, error) {
-			// http.ProxyFromEnvironment keys off the request scheme; make
-			// sure ws/wss are mapped to their http(s) equivalents.
+			// 1. HTTP(S)_PROXY via the standard env resolution. It keys off
+			//    the request scheme, so map ws/wss to http/https first.
 			pr := r
 			switch r.URL.Scheme {
 			case "ws":
@@ -65,9 +67,99 @@ func newDialer(u *url.URL) *websocket.Dialer {
 				pr = r.Clone(r.Context())
 				pr.URL.Scheme = "https"
 			}
-			return http.ProxyFromEnvironment(pr)
+			if pu, err := http.ProxyFromEnvironment(pr); err != nil || pu != nil {
+				return pu, err
+			}
+			// 2. ALL_PROXY (socks5://...). gorilla's vendored
+			//    golang.org/x/net/proxy handles the socks5 scheme; NO_PROXY
+			//    is honored through FromEnvironment's per-host wrapper.
+			allProxy := socksFromEnvironment()
+			if allProxy == nil {
+				return nil, nil
+			}
+			if perHostBypass(r.URL.Host, allProxy.noProxy) {
+				return nil, nil
+			}
+			return allProxy.url, nil
 		},
 	}
+}
+
+// socksFromEnvironment resolves ALL_PROXY/all_proxy once per process.
+func socksFromEnvironment() *socksEnv {
+	proxyEnvOnce.once.Do(func() {
+		raw := os.Getenv("ALL_PROXY")
+		if raw == "" {
+			raw = os.Getenv("all_proxy")
+		}
+		if raw == "" {
+			return
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return
+		}
+		switch u.Scheme {
+		case "socks5", "socks5h":
+			u.Scheme = "socks5" // gorilla's proxy_FromURL only knows socks5
+			proxyEnvOnce.url = u
+		case "http", "https":
+			// Already covered by HTTP(S)_PROXY resolution above? No:
+			// ALL_PROXY with an http scheme is not read by
+			// ProxyFromEnvironment, so pass it through as a normal proxy.
+			proxyEnvOnce.url = u
+		}
+		proxyEnvOnce.noProxy = os.Getenv("NO_PROXY")
+		if proxyEnvOnce.noProxy == "" {
+			proxyEnvOnce.noProxy = os.Getenv("no_proxy")
+		}
+	})
+	return proxyEnvOnce
+}
+
+var proxyEnvOnce = &socksEnv{}
+
+type socksEnv struct {
+	once sync.Once
+	url  *url.URL
+	// noProxy is the raw NO_PROXY list (hostnames, comma-separated).
+	noProxy string
+}
+
+// perHostBypass reports whether host matches any NO_PROXY entry. Supports
+// exact host, host:port, and dotted-suffix matches (".example.com" or
+// "example.com" both cover subdomains), mirroring x/net/proxy.PerHost.
+func perHostBypass(hostport, noProxy string) bool {
+	if noProxy == "" {
+		return false
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(host, ".")
+	for _, entry := range strings.Split(noProxy, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		entry = strings.TrimSuffix(entry, ".")
+		if entry == "*" {
+			return true
+		}
+		// Port-bearing entries must match the original host:port.
+		if strings.Contains(entry, ":") && entry == hostport {
+			return true
+		}
+		entryHost := entry
+		if !strings.HasPrefix(entry, ".") {
+			entryHost = "." + entry
+		}
+		if strings.HasSuffix(host, entryHost) || host == strings.TrimPrefix(entryHost, ".") {
+			return true
+		}
+	}
+	return false
 }
 
 func netDial(network, addr string) (net.Conn, error) {
