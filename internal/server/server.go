@@ -10,6 +10,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log"
 	"net"
@@ -32,6 +33,10 @@ type Server struct {
 	Tun    tunnel.Interface
 	Keep   proto.KeepAlive
 	Logger *log.Logger
+	// MaxSessions caps concurrent authenticated sessions (0 = unlimited).
+	// Without a cap a flood of valid-credential handshakes would spawn
+	// unbounded goroutines.
+	MaxSessions int
 
 	upgrader websocket.Upgrader
 
@@ -78,6 +83,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission control: reject new sessions once the cap is reached.
+	// (Not a silent drop — the credentials are valid, this is load-shedding,
+	// and the client will back off and retry.)
+	s.mu.Lock()
+	if s.MaxSessions > 0 && len(s.sessions) >= s.MaxSessions {
+		s.mu.Unlock()
+		s.Logger.Printf("server: session limit (%d) reached; refusing %s", s.MaxSessions, r.URL.Path)
+		silentDrop(w, s.Logger)
+		return
+	}
+	s.mu.Unlock()
+
 	// --- Upgrade ----------------------------------------------------------
 	// gorilla validates the WebSocket handshake here. A legit client with good
 	// credentials but a malformed handshake receives a normal 4xx; that is not
@@ -108,13 +125,23 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) track(sess *Session) {
 	s.mu.Lock()
+	if old, ok := s.sessions[sess.UUID]; ok && old != sess {
+		// Duplicate connection for the same UUID: evict the old session so
+		// its pipe shuts down, rather than letting two pipes race for the
+		// same peer (and the first-finished one untracking the other's entry).
+		old.cancel()
+	}
 	s.sessions[sess.UUID] = sess
 	s.mu.Unlock()
 }
 
 func (s *Server) untrack(sess *Session) {
 	s.mu.Lock()
-	delete(s.sessions, sess.UUID)
+	// Only remove if this session is still the tracked one; an evicting
+	// replacement may have already taken the slot.
+	if s.sessions[sess.UUID] == sess {
+		delete(s.sessions, sess.UUID)
+	}
 	s.mu.Unlock()
 }
 
@@ -145,14 +172,7 @@ func checkBearer(header, psk string) bool {
 
 // subtleEqual compares two strings in constant time.
 func subtleEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // silentDrop implements SPEC 2.4: emit no HTTP response and force-close the
