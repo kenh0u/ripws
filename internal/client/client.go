@@ -88,10 +88,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			logger.Printf("client: connect failed (attempt %d): %v", attempt, err)
 			if werr := bo.Wait(ctx, attempt); werr != nil {
-				if errors.Is(werr, proto.ErrMaxAttempts) {
-					return werr
-				}
-				return werr
+				return werr // ErrMaxAttempts or ctx cancellation
 			}
 			attempt++
 			continue

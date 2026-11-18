@@ -3,7 +3,6 @@ package proto
 import (
 	"context"
 	"errors"
-	"math/rand/v2"
 	"time"
 )
 
@@ -68,6 +67,3 @@ func (b Backoff) Wait(ctx context.Context, attempt int) error {
 		return nil
 	}
 }
-
-// randIntn is a small helper kept for parity across the package.
-func randIntn(n int) int { return rand.IntN(n) }

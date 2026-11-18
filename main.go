@@ -25,6 +25,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -174,7 +175,7 @@ func cmdUp(args []string) {
 	defer stop()
 
 	if cfg.IsUserspace() {
-		runUpUserspace(ctx, cfg, creds, ifName)
+		must(runUpUserspace(ctx, cfg, creds, ifName))
 	} else {
 		runUpKernel(ctx, cfg, creds, ifName)
 	}
@@ -195,6 +196,7 @@ func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Cre
 		Routes:   cfg.AllAllowedIPs(),
 		DNS:      cfg.Interface.DNS,
 		Table:    cfg.Interface.Table,
+		Endpoint: endpointHost(cfg),
 		PreUp:    cfg.Interface.PreUp,
 		PostUp:   cfg.Interface.PostUp,
 		PreDown:  cfg.Interface.PreDown,
@@ -213,14 +215,14 @@ func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Cre
 	}()
 
 	if cfg.IsServer() {
-		runServer(ctx, cfg, creds, tun)
+		must(runServer(ctx, cfg, creds, tun))
 	} else {
-		runClient(ctx, cfg, tun)
+		must(runClient(ctx, cfg, tun))
 	}
 }
 
 // runUpUserspace brings up a userspace-mode tunnel (gVisor netstack, no root).
-func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string) {
+func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string) error {
 	// Strip CIDR suffixes — NewUserspace takes plain IPs.
 	localAddrs := make([]string, 0, len(cfg.Interface.Address))
 	for _, a := range cfg.Interface.Address {
@@ -237,7 +239,7 @@ func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.
 		routes = append(routes, tunnel.Route{Destination: cidr})
 	}
 
-	tun, err := tunnel.NewUserspace(localAddrs, routes)
+	tun, err := tunnel.NewUserspaceMTU(localAddrs, routes, cfg.Interface.MTU)
 	must(err)
 	defer tun.Close()
 
@@ -251,18 +253,36 @@ func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.
 	}
 
 	if cfg.IsServer() {
-		runServer(ctx, cfg, creds, tun)
-	} else {
-		runClient(ctx, cfg, tun)
+		return runServer(ctx, cfg, creds, tun)
 	}
+	return runClient(ctx, cfg, tun)
+}
+
+// endpointHost extracts the host portion of the first peer's Endpoint URL, so
+// a host route can be pinned outside the tunnel before the default route
+// moves into the VPN. Empty on the server.
+func endpointHost(cfg *config.QuickConfig) string {
+	if cfg.IsServer() || len(cfg.Peers) == 0 || cfg.Peers[0].Endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(cfg.Peers[0].Endpoint)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	if net.ParseIP(host) == nil {
+		return "" // DNS name: resolved later by the client dialer; cannot pin
+	}
+	return host
 }
 
 // runServer starts the HTTP server that accepts WebSocket tunnels.
-func runServer(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, tun tunnel.Interface) {
+func runServer(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, tun tunnel.Interface) error {
 	listen := fmt.Sprintf(":%d", cfg.Interface.ListenPort)
 	srv := server.New(creds, tun)
 	srv.Logger = log.New(os.Stderr, "server: ", log.LstdFlags|log.Lmicroseconds)
 	srv.Keep.Window = 330 * time.Second
+	srv.MaxSessions = 1024
 
 	httpSrv := &http.Server{
 		Addr:              listen,
@@ -281,25 +301,26 @@ func runServer(ctx context.Context, cfg *config.QuickConfig, creds *config.Crede
 
 	log.Printf("up: server listening on %s", listen)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fatalf("up: server: %v", err)
+		return fmt.Errorf("up: server: %w", err)
 	}
+	return nil
 }
 
 // runClient starts the WebSocket client that connects to the server.
-func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interface) {
+func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interface) error {
 	if len(cfg.Peers) == 0 {
-		fatalf("up: client config requires at least one [Peer] with Endpoint")
+		return fmt.Errorf("up: client config requires at least one [Peer] with Endpoint")
 	}
 	peer := cfg.Peers[0]
 	if peer.Endpoint == "" {
-		fatalf("up: client [Peer] requires Endpoint = ws(s)://host:port")
+		return fmt.Errorf("up: client [Peer] requires Endpoint = ws(s)://host:port")
 	}
 	if peer.UUID == "" {
-		fatalf("up: client [Peer] requires UUID")
+		return fmt.Errorf("up: client [Peer] requires UUID")
 	}
 	psk := cfg.PeerPSK(&peer)
 	if err := config.ValidatePSK(psk); err != nil {
-		fatalf("up: %v", err)
+		return fmt.Errorf("up: %w", err)
 	}
 
 	// Construct the full WebSocket URL: endpoint + "/" + uuid
@@ -310,7 +331,7 @@ func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interfac
 		pingInterval = time.Duration(peer.PersistentKeepalive) * time.Second
 	}
 	if pingInterval < 30*time.Second || pingInterval > 300*time.Second {
-		fatalf("up: PersistentKeepalive must be within [30, 300] seconds")
+		return fmt.Errorf("up: PersistentKeepalive must be within [30, 300] seconds")
 	}
 
 	clCfg := client.Config{
@@ -325,8 +346,9 @@ func runClient(ctx context.Context, cfg *config.QuickConfig, tun tunnel.Interfac
 		Logger: log.New(os.Stderr, "client: ", log.LstdFlags|log.Lmicroseconds),
 	}
 	if err := client.Run(ctx, clCfg); err != nil && !errors.Is(err, context.Canceled) {
-		fatalf("up: client: %v", err)
+		return fmt.Errorf("up: client: %w", err)
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -352,18 +374,22 @@ func cmdDown(args []string) {
 		var pid int
 		fmt.Sscanf(string(data), "%d", &pid)
 		if pid > 0 {
-			proc, err := os.FindProcess(pid)
-			if err == nil {
-				if err := proc.Signal(syscall.SIGTERM); err == nil {
-					log.Printf("down: sent SIGTERM to pid %d (%s)", pid, ifName)
-					// Wait for the process to exit.
-					for i := 0; i < 50; i++ {
-						if proc.Signal(syscall.Signal(0)) != nil {
-							break // process is gone
+			if comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil && strings.TrimSpace(string(comm)) == "ripws" {
+				proc, err := os.FindProcess(pid)
+				if err == nil {
+					if err := proc.Signal(syscall.SIGTERM); err == nil {
+						log.Printf("down: sent SIGTERM to pid %d (%s)", pid, ifName)
+						// Wait for the process to exit.
+						for i := 0; i < 50; i++ {
+							if proc.Signal(syscall.Signal(0)) != nil {
+								break // process is gone
+							}
+							time.Sleep(100 * time.Millisecond)
 						}
-						time.Sleep(100 * time.Millisecond)
 					}
 				}
+			} else {
+				log.Printf("down: pid %d is not a ripws process (comm mismatch or gone); skipping signal", pid)
 			}
 		}
 		os.Remove(pidPath)
@@ -405,8 +431,19 @@ func resolveConfigPath(arg string) string {
 	return "/etc/ripws/" + arg + ".conf"
 }
 
-// pidFilePath returns the PID file path for a given interface name.
+// pidFilePath returns the PID file path for a given interface name. Uses
+// /run/ripws (root-owned, created 0700) when writable so an unprivileged
+// user cannot poison or hijack another user's PID file; falls back to
+// /tmp/ripws-<if>.pid for unprivileged runs.
 func pidFilePath(ifName string) string {
+	dir := "/run/ripws"
+	if err := os.MkdirAll(dir, 0700); err == nil {
+		if f, err := os.OpenFile(dir+"/.probe", os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+			f.Close()
+			os.Remove(dir + "/.probe")
+			return filepath.Join(dir, ifName+".pid")
+		}
+	}
 	return filepath.Join("/tmp", "ripws-"+ifName+".pid")
 }
 
