@@ -8,7 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -41,6 +43,52 @@ type Config struct {
 	Header http.Header
 }
 
+// newDialer builds the WebSocket dialer for target u. Proxy support is a
+// core design point — RIPWS must pierce environments where the only way
+// out is an HTTP proxy — so we default to the standard environment
+// (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) resolution, including the ws->http and
+// wss->https scheme mapping.
+func newDialer(u *url.URL) *websocket.Dialer {
+	return &websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		ReadBufferSize:   tunnel.MTU,
+		WriteBufferSize:  tunnel.MTU,
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			// http.ProxyFromEnvironment keys off the request scheme; make
+			// sure ws/wss are mapped to their http(s) equivalents.
+			pr := r
+			switch r.URL.Scheme {
+			case "ws":
+				pr = r.Clone(r.Context())
+				pr.URL.Scheme = "http"
+			case "wss":
+				pr = r.Clone(r.Context())
+				pr.URL.Scheme = "https"
+			}
+			return http.ProxyFromEnvironment(pr)
+		},
+	}
+}
+
+func netDial(network, addr string) (net.Conn, error) {
+	return net.DialTimeout(network, addr, 10*time.Second)
+}
+
+func copyStream(dst io.Writer, src io.Reader) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 // Run connects and maintains the session until ctx is cancelled. It reconnects
 // automatically after connection losses using exponential backoff. The tunnel
 // interface is kept open across reconnects so the kernel/userspace route
@@ -71,12 +119,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("ripws: URL scheme must be ws/wss/http/https (got %q)", sch)
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		// Allow large binary frames (we cap reads locally at MTU).
-		ReadBufferSize:   tunnel.MTU,
-		WriteBufferSize:  tunnel.MTU,
-	}
+	dialer := newDialer(u)
 
 	attempt := 0
 	for {
@@ -115,7 +158,7 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 // dialOnce performs a single authenticated WebSocket handshake.
-func dialOnce(ctx context.Context, dialer websocket.Dialer, target string, cfg Config) (*websocket.Conn, error) {
+func dialOnce(ctx context.Context, dialer *websocket.Dialer, target string, cfg Config) (*websocket.Conn, error) {
 	hdr := http.Header{}
 	if cfg.Header != nil {
 		for k, v := range cfg.Header {
