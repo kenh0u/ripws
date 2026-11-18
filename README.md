@@ -31,6 +31,7 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 - [Subcommand Overview](#subcommand-overview)
 - [Quick Start](#quick-start)
 - [Config File Format](#config-file-format)
+- [NixOS Module](#nixos-module)
 - [genkey](#genkey)
 - [genuuid](#genuuid)
 - [Usage Examples](#usage-examples)
@@ -191,6 +192,103 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 The interface name is derived from the config file's basename minus `.conf`:
 - `ws0.conf` → `ws0`
 - `/etc/ripws/tunnel1.conf` → `tunnel1`
+
+---
+
+## NixOS Module
+
+`nix/module.nix` provides a declarative, wg-quick-style deployment via
+`services.ripws.tunnels.<name>` (the attr key becomes both the systemd
+unit suffix and the TUN interface name). One foreground service
+`ripws-<name>` per tunnel: `Type=simple`, `Restart=always`, SIGTERM-clean
+shutdown, ordering after `network-online.target`.
+
+```nix
+# flake inputs: ripws.url = "github:kenh0u/ripws";
+{ inputs, ... }: {
+  imports = [ inputs.ripws.nixosModules.default ];
+
+  services.ripws.tunnels.server = {
+    address        = [ "10.7.0.1/24" ];
+    listenPort     = 8080;                       # set → this tunnel is a server
+    privateKeyFile = "/run/secrets/ripws.key";   # 44-char base64 PSK
+    peers = [
+      { uuid = "…client-uuid…"; allowedIPs = [ "10.7.0.2/32" ]; }
+    ];
+  };
+}
+```
+
+Client side (no `listenPort`, peer carries the endpoint):
+
+```nix
+services.ripws.tunnels.client = {
+  address        = [ "10.7.0.2/24" ];
+  privateKeyFile = "/run/secrets/ripws.key";
+  peers = [
+    {
+      uuid       = "…same-uuid…";
+      endpoint   = "ws://server.example:8080";   # or wss://…
+      allowedIPs = [ "0.0.0.0/0" ];              # full-tunnel client
+    }
+  ];
+  # Corporate NAT/proxy traversal (env-driven, see Usage Examples):
+  proxyEnvironment = { ALL_PROXY = "socks5h://proxy.corp:1080"; };
+};
+```
+
+### Options
+
+| Option | Default | Maps to config key |
+|---|---|---|
+| `mode` | `"kernel"` | `Mode` |
+| `address` | — | `Address` |
+| `listenPort` | `null` (client) | `ListenPort` |
+| `privateKey` / `privateKeyFile` | `null` | `PrivateKey` |
+| `mtu` | ripws default (1420) | `MTU` |
+| `dns` | `[ ]` | `DNS` |
+| `table` | `"auto"` | `Table` |
+| `nat` | `false` | `NAT` (userspace) |
+| `peers[].uuid` | required | `UUID` |
+| `peers[].presharedKey` / `…File` | `null` | `PresharedKey` |
+| `peers[].allowedIPs` | `[ ]` | `AllowedIPs` |
+| `peers[].endpoint` | `null` | `Endpoint` |
+| `peers[].persistentKeepalive` | `30` | `PersistentKeepalive` |
+| `preStart` / `postStart` | `""` | systemd hooks |
+| `autoStart` | `true` | wanted-by boot |
+| `proxyEnvironment` | `{ }` | unit `Environment` |
+| `extraPackages` | `[ ]` | service PATH |
+
+### Secrets handling
+
+- `privateKeyFile` / `presharedKeyFile`: contents **never enter the Nix
+  store**. A placeholder token is written into the (store) start script and
+  substituted at `ExecStart` into `/run/ripws/<name>.conf` (dir 0700, file
+  0600, root-only), then `ripws up` reads it. Unresolved placeholders abort
+  the start.
+- `privateKey` / `presharedKey` (inline): rendered straight into the config —
+  convenience and test setups only; the value is world-readable in the store.
+
+### Validation
+
+- PSK (base64, 44 chars) and UUIDv4 formats are checked by option types.
+- Assertions: server tunnels need a key; client tunnels need ≥1 endpoint;
+  `privateKey` and `privateKeyFile` are mutually exclusive.
+
+### Tests
+
+```sh
+nix build .#checks.x86_64-linux.ripws-eval   # pure-eval: unit wiring, secret
+                                            # placeholders, assertions (~sec)
+nix build .#checks.x86_64-linux.ripws-vm     # NixOS VM: kernel+userspace pair,
+                                            # ping both ways, restart, cleanup
+                                            # (~min, needs /dev/kvm)
+```
+
+The VM test (`nix/vm-test.nix`) boots two NixOS guests running four tunnels
+(kernel↔kernel and userspace-server↔kernel-client), verifies config
+rendering/perms in `/run/ripws`, bidirectional connectivity, client restart
+with reconnect and interface cleanup, and recovery after a server restart.
 
 ---
 
@@ -522,7 +620,8 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 
 ```
 main.go                      up/down/genkey/genuuid dispatch
-flake.nix                    buildGoModule (static binary)
+flake.nix                    buildGoModule (static binary), nixosModules, checks
+nix/                         module.nix (NixOS), package.nix, eval-test.nix, vm-test.nix
 internal/
   config/                    credentials, PSK validation (SPEC 2.2)
     quickconf.go             wg-quick-compatible INI parser (Mode, NAT fields)

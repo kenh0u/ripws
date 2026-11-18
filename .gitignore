@@ -4,7 +4,8 @@
 /result-*
 
 # Nix
-/nix/
+/nix/*
+!/nix/*.nix
 
 # Go
 /*.test

@@ -7,33 +7,33 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
+    {
+      # NixOS module:
+      #   services.ripws.tunnels.<name> = { ... };
+      nixosModules.default = import ./nix/module.nix;
+      nixosModules.ripws = self.nixosModules.default;
+
+      # Make pkgs.ripws available: inputs.ripws.overlays.default
+      overlays.default = final: prev: {
+        ripws = self.packages.${final.system}.ripws or final.callPackage ./nix/package.nix { };
+      };
+    } //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         version = "0.1.0";
-        ripws = pkgs.buildGoModule {
-          pname = "ripws";
-          inherit version;
-          src = ./.;
-          # `subPackages` defaults to "."; we only have the root package as
-          # the binary entry point.
-          subPackages = [ "." ];
-          # Computed with `nix build` (lib.fakeHash then read the got hash).
-          vendorHash = "sha256-2oHinTZ5MU464sDS9faZdGC7ggiKLac8PR9Xod9OcyY=";
-          # Pure-Go static build so the binary runs in any minimal container
-          # (no nix glibc loader needed).
-          env.CGO_ENABLED = 0;
-          meta = with pkgs.lib; {
-            description = "Raw IP over WebSocket tunnel";
-            license = licenses.mit;
-            mainProgram = "ripws";
-          };
-        };
+        ripws = pkgs.callPackage ./nix/package.nix { inherit version; };
       in
       {
         packages = {
           default = ripws;
           ripws = ripws;
+        };
+        checks = {
+          # Pure-eval tests of the NixOS module (fast, no builds).
+          ripws-eval = import ./nix/eval-test.nix { inherit pkgs ripws; module = ./nix/module.nix; };
+          # Full end-to-end VM test (needs KVM).
+          ripws-vm = import ./nix/vm-test.nix { inherit pkgs; ripwsPackage = ripws; };
         };
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [ go gopls gotools ];

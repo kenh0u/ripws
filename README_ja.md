@@ -21,6 +21,7 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
 - [サブコマンド概要](#サブコマンド概要)
 - [クイックスタート](#クイックスタート)
 - [設定ファイル形式](#設定ファイル形式)
+- [NixOSモジュール](#nixosモジュール)
 - [genkey](#genkey)
 - [genuuid](#genuuid)
 - [使用例](#使用例)
@@ -176,6 +177,89 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 設定ファイルのベース名から `.conf` を取り除いたものがインターフェース名になります:
 - `ws0.conf` → `ws0`
 - `/etc/ripws/tunnel1.conf` → `tunnel1`
+
+---
+
+## NixOSモジュール
+
+`nix/module.nix` は `services.ripws.tunnels.<name>` による宣言的（wg-quick風）デプロイを提供します。attr名は systemd ユニット名と TUN インターフェース名の両方に使われます。トンネルごとに `ripws-<name>` フォアグラウンドサービス（`Type=simple`、`Restart=always`、SIGTERMでクリーンシャットダウン、`network-online.target` 待ち）が生成されます。
+
+```nix
+# flake inputs: ripws.url = "github:kenh0u/ripws";
+{ inputs, ... }: {
+  imports = [ inputs.ripws.nixosModules.default ];
+
+  services.ripws.tunnels.server = {
+    address        = [ "10.7.0.1/24" ];
+    listenPort     = 8080;                       # 設定するとサーバー側
+    privateKeyFile = "/run/secrets/ripws.key";   # 44文字Base64 PSK
+    peers = [
+      { uuid = "…client-uuid…"; allowedIPs = [ "10.7.0.2/32" ]; }
+    ];
+  };
+}
+```
+
+クライアント側（`listenPort` なし、peerにendpoint）:
+
+```nix
+services.ripws.tunnels.client = {
+  address        = [ "10.7.0.2/24" ];
+  privateKeyFile = "/run/secrets/ripws.key";
+  peers = [
+    {
+      uuid       = "…same-uuid…";
+      endpoint   = "ws://server.example:8080";   # wss://も可
+      allowedIPs = [ "0.0.0.0/0" ];              # 全トラフィック経由
+    }
+  ];
+  # 企業NAT/プロキシ越え（環境変数駆動）:
+  proxyEnvironment = { ALL_PROXY = "socks5h://proxy.corp:1080"; };
+};
+```
+
+### オプション一覧
+
+| オプション | 既定値 | 設定ファイルのキー |
+|---|---|---|
+| `mode` | `"kernel"` | `Mode` |
+| `address` | 必須 | `Address` |
+| `listenPort` | `null`（クライアント） | `ListenPort` |
+| `privateKey` / `privateKeyFile` | `null` | `PrivateKey` |
+| `mtu` | ripws既定（1420） | `MTU` |
+| `dns` | `[ ]` | `DNS` |
+| `table` | `"auto"` | `Table` |
+| `nat` | `false` | `NAT`（userspace） |
+| `peers[].uuid` | 必須 | `UUID` |
+| `peers[].presharedKey` / `…File` | `null` | `PresharedKey` |
+| `peers[].allowedIPs` | `[ ]` | `AllowedIPs` |
+| `peers[].endpoint` | `null` | `Endpoint` |
+| `peers[].persistentKeepalive` | `30` | `PersistentKeepalive` |
+| `preStart` / `postStart` | `""` | systemdフック |
+| `autoStart` | `true` | ブート時有効化 |
+| `proxyEnvironment` | `{ }` | ユニットの `Environment` |
+| `extraPackages` | `[ ]` | サービスのPATH |
+
+### 秘密情報の取り扱い
+
+- `privateKeyFile` / `presharedKeyFile`: 中身は**Nixストアに一切書き込まれません**。起動スクリプトにはプレースホルダトークンだけが存在し、`ExecStart` 時に `/run/ripws/<name>.conf`（ディレクトリ0700・ファイル0600・rootのみ）へ置換されます。未解決のプレースホルダがあれば起動を中止します。
+- `privateKey` / `presharedKey`（インライン）: 設定へ直接展開されます。利便性・テスト用のみ推奨で、値はストア内で全ユーザーから読める状態になります。
+
+### 検証
+
+- PSK（Base64・44文字）とUUIDv4の形式はオプション型で検査されます。
+- アサーション: サーバーには鍵が必須、クライアントにはendpointを持つpeerが1つ以上必要、`privateKey` と `privateKeyFile` は排他。
+
+### テスト
+
+```sh
+nix build .#checks.x86_64-linux.ripws-eval   # 純評価テスト: ユニット生成・秘密
+                                            # 置換・アサーション（数秒）
+nix build .#checks.x86_64-linux.ripws-vm     # NixOS VMテスト: kernel+userspace
+                                            # 疎通・再起動・後始末（要/dev/kvm）
+```
+
+VMテスト（`nix/vm-test.nix`）は2台のNixOSゲストに4トンネル（kernel↔kernel、userspaceサーバー↔kernelクライアント）を起動し、`/run/ripws` の設定レンダリングと権限、双方向ping、クライアント再起動時の再接続とインターフェース後始末、サーバー再起動後の回復を検証します。
 
 ---
 
@@ -490,7 +574,8 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 
 ```
 main.go                      up/down/genkey/genuuid ディスパッチ
-flake.nix                    buildGoModule（静的バイナリ）
+flake.nix                    buildGoModule（静的バイナリ）、nixosModules、checks
+nix/                         module.nix（NixOS）、package.nix、eval-test.nix、vm-test.nix
 internal/
   config/                    認証情報、PSKバリデーション (SPEC 2.2)
     quickconf.go             wg-quick互換INIパーサー（Mode, NATフィールド対応）
