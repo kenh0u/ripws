@@ -36,13 +36,19 @@ pkgs.testers.runNixOSTest {
           address = [ "10.7.0.1/24" ];
           listenPort = 8080;
           privateKey = psk;
-          peers = [
-            { uuid = uuid0; allowedIPs = [ "10.7.0.2/32" ]; }
-            # 198.51.100.0/24 (TEST-NET-2, standing in for the MS CIDRs) is
-            # routed into the tunnel toward c2, where its proxyRules
-            # intercept the range in-process.
-            { uuid = uuid2; allowedIPs = [ "10.7.0.3/32" "198.51.100.0/24" ]; }
-          ];
+          peers = [ { uuid = uuid0; allowedIPs = [ "10.7.0.2/32" ]; } ];
+        };
+        s2 = {
+          # dedicated server tunnel for the split-proxy client (the server
+          # dataplane is one TUN per tunnel, so a second peer range needs
+          # its own tunnel)
+          address = [ "10.12.0.1/24" ];
+          listenPort = 8082;
+          privateKey = psk;
+          # 198.51.100.0/24 (TEST-NET-2, standing in for the MS CIDRs) is
+          # routed into the tunnel toward c2, where its proxyRules intercept
+          # the range in-process.
+          peers = [ { uuid = uuid2; allowedIPs = [ "10.12.0.2/32" "198.51.100.0/24" ]; } ];
         };
         s1 = {
           mode = "userspace";
@@ -173,13 +179,13 @@ pkgs.testers.runNixOSTest {
           # the MS CIDRs) is intercepted in-process and carried through the
           # local mock proxy with SNI-based CONNECT; the kernel path (ping,
           # plain TCP to 10.7.0.x) stays untouched.
-          address = [ "10.7.0.3/24" ];
+          address = [ "10.12.0.2/24" ];
           privateKeyFile = "/run/secrets/ripws-c2.key";
           preStart = "install -d -m 700 /run/secrets && echo '${psk}' > /run/secrets/ripws-c2.key";
           peers = [ {
             uuid = uuid2;
-            endpoint = "ws://server:8080";
-            allowedIPs = [ "10.7.0.0/24" ];
+            endpoint = "ws://server:8082";
+            allowedIPs = [ "10.12.0.0/24" ];
           } ];
           proxyRules = [ {
             cidrs = [ "198.51.100.0/24" ];
@@ -213,6 +219,7 @@ pkgs.testers.runNixOSTest {
     server.wait_for_open_port(8081)
     server.wait_for_unit("ripws-s0.service")
     server.wait_for_unit("ripws-s1.service")
+    server.wait_for_unit("ripws-s2.service")
     client.wait_for_unit("ripws-c0.service")
     client.wait_for_unit("ripws-c1.service")
     client.wait_for_unit("ripws-c2.service")
@@ -262,8 +269,8 @@ pkgs.testers.runNixOSTest {
     with subtest("split proxy SNI"):
         client.succeed("rm -f /tmp/proxy-connects.log")
         # kernel dataplane must still work alongside the proxy path
-        # (10.7.0.3 is c2's TUN address — served by the kernel, not the proxy)
-        server.succeed("ping -c 2 -W 2 10.7.0.3")
+        # (10.12.0.2 is c2's TUN address — served by the kernel, not the proxy)
+        server.succeed("ping -c 2 -W 2 10.12.0.2")
         # HTTPS to the "MS" range: SNI extracted, CONNECT ms-test.example.com
         out = server.succeed(
             "curl -s --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
