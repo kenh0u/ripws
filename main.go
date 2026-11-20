@@ -301,7 +301,7 @@ func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.
 		matcherRules := proxyRules
 		if err := tun.EnableNATWithRules(
 			log.New(os.Stderr, "proxy: ", log.LstdFlags|log.Lmicroseconds),
-			matcherRules, nil); err != nil {
+			matcherRules, nil, nil); err != nil {
 			return fmt.Errorf("up: proxy rules: %w", err)
 		}
 	} else if cfg.Interface.NAT {

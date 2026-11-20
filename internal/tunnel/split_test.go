@@ -234,7 +234,7 @@ func TestUserspaceProxyRules(t *testing.T) {
 		CIDRs: []string{"203.0.113.0/24"},
 		Proxy: "http://" + proxy.addr(),
 	}}
-	if err := us.EnableNATWithRules(nil, rules, nil); err != nil {
+	if err := us.EnableNATWithRules(nil, rules, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

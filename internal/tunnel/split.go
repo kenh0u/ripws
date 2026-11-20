@@ -63,13 +63,13 @@ func NewSplit(primary Interface, localAddrs []string, rules []*ProxyRule, mtu in
 	if err != nil {
 		return nil, err
 	}
-	if err := us.EnableNATWithRules(logger, rules, m); err != nil {
+	split := &SplitInterface{primary: primary, userspace: us, match: m}
+	split.start() // allocates pktCh and starts the primary pump
+	if err := us.EnableNATWithRules(logger, rules, m, split.pktCh); err != nil {
 		us.Close()
+		split.Close()
 		return nil, err
 	}
-	split := &SplitInterface{primary: primary, userspace: us, match: m}
-	split.start()
-	us.startEgressLoopPkt(split.pktCh)
 	return split, nil
 }
 
@@ -192,7 +192,7 @@ func (s *SplitInterface) Close() error {
 // rarely usable through corporate egress), so matched UDP flows are refused
 // immediately (return false) instead of hanging — QUIC's UDP/443 fallback
 // then fails fast and clients fall back to TCP.
-func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m *proxyMatcher) error {
+func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m *proxyMatcher, sink chan<- []byte) error {
 	if m == nil {
 		var err error
 		if m, err = newProxyMatcher(rules); err != nil {
@@ -209,7 +209,6 @@ func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m
 		dstAddrIP := id.LocalAddress
 		dst := netipAddrFromTcpip(dstAddrIP)
 
-		logf("proxy: fwd SYN dst=%s:%d", id.LocalAddress, id.LocalPort)
 		rule := m.Match(dst)
 		if rule == nil {
 			// Not covered by a proxy rule (shouldn't happen — WritePacket
@@ -289,7 +288,7 @@ func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m
 	})
 	u.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
-	u.startEgressLoop()
+	u.startEgressLoopPkt(sink)
 	logf("proxy: %d proxy rule(s) installed (TCP via proxy, UDP refused)", len(rules))
 	return nil
 }
