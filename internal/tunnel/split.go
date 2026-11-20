@@ -209,6 +209,7 @@ func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m
 		dstAddrIP := id.LocalAddress
 		dst := netipAddrFromTcpip(dstAddrIP)
 
+		logf("proxy: fwd SYN dst=%s:%d", id.LocalAddress, id.LocalPort)
 		rule := m.Match(dst)
 		if rule == nil {
 			// Not covered by a proxy rule (shouldn't happen — WritePacket
