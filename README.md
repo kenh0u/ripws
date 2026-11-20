@@ -13,6 +13,10 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
   - `kernel` — host TUN device (`songgao/water`), requires `CAP_NET_ADMIN` +
     `/dev/net/tun`. (wg-quick-respect)
   - `userspace` — in-process gVisor netstack, **no privileges, no TUN**. (Tailscale-respect)
+- **Split-dataplane `[ProxyRule]`** — pick destination CIDRs that bypass the
+  kernel TUN, terminate in-process, and egress via HTTP `CONNECT` /
+  SOCKS5 proxy — with TLS SNI extraction so corporate proxy domain ACLs
+  and audit logs keep working. Kernel mode stays fully intact.
 - **Userspace NAT gateway** — transit traffic from the tunnel is transparently
   proxied out through the host's kernel networking via `net.Dial`. No
   `CAP_NET_ADMIN` required.
@@ -40,6 +44,7 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
   - [3. Userspace NAT Gateway](#3-userspace-nat-gateway)
   - [4. Cloudflare Tunnel (wss://)](#4-cloudflare-tunnel-wss)
   - [5. Multiple Clients (JSON Config File)](#5-multiple-clients-json-config-file)
+  - [6. Split-Dataplane: Selected CIDRs through a Corporate Proxy](#6-split-dataplane-selected-cidrs-through-a-corporate-proxy)
 - [Test Scripts](#test-scripts)
 - [Docker Tests](#docker-tests)
 - [Project Layout](#project-layout)
@@ -164,6 +169,37 @@ Uses INI format with an `[Interface]` section and one or more `[Peer]` sections.
 | `Endpoint` | client only | `ws(s)://host:port` server URL (UUID appended automatically) |
 | `PersistentKeepalive` | (optional) | WebSocket Ping interval in seconds (30–300) |
 
+### [ProxyRule] Section (repeatable)
+
+Packets whose destination falls in `CIDRs` bypass the kernel TUN entirely:
+they are terminated in-process (gVisor netstack) and carried to the upstream
+proxy as a new TCP connection. Everything else — `AllowedIPs` routes, SSH,
+ICMP, 10.x transit — keeps flowing through the kernel datapath unchanged.
+Works with `Mode = kernel` and `Mode = userspace`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `CIDRs` | ✓ | Destination CIDRs to intercept (comma-separated, IPv4/IPv6) |
+| `Proxy` | ✓ | `http://` `https://` `socks5://` `socks5h://` URL (optional `user:pass@`) |
+| `SNI` | (default `false`) | Peek the TLS ClientHello and `CONNECT <sni>:<port>` instead of `<dstIP>:<port>` |
+
+```ini
+[ProxyRule]
+CIDRs = 20.20.32.0/19,20.190.128.0/18,40.126.0.0/18
+Proxy = http://proxy.corp:8080
+SNI   = true
+```
+
+With multiple rules, the **longest matching prefix** wins (first-configured
+on ties). Notes:
+
+- **UDP** to matched CIDRs is refused immediately (HTTP proxies carry TCP
+  only; QUIC clients fall back to TCP rather than hang).
+- With `SNI = true`, non-TLS flows, missing SNI, or a 500 ms peek timeout
+  fall back to a `CONNECT <dstIP>:<port>` (same as `SNI = false`).
+- Never list the proxy's own IP in `CIDRs` — that routes its connections
+  back into itself. The proxy is reached through the host's normal routing.
+
 ### WireGuard Field Mapping
 
 | WireGuard | RIPWS | Notes |
@@ -249,6 +285,9 @@ services.ripws.tunnels.client = {
 | `dns` | `[ ]` | `DNS` |
 | `table` | `"auto"` | `Table` |
 | `nat` | `false` | `NAT` (userspace) |
+| `proxyRules[].cidrs` | — | `CIDRs` in `[ProxyRule]` |
+| `proxyRules[].proxy` | — | `Proxy` in `[ProxyRule]` |
+| `proxyRules[].sni` | `false` | `SNI` in `[ProxyRule]` |
 | `peers[].uuid` | required | `UUID` |
 | `peers[].presharedKey` / `…File` | `null` | `PresharedKey` |
 | `peers[].allowedIPs` | `[ ]` | `AllowedIPs` |
@@ -273,7 +312,9 @@ services.ripws.tunnels.client = {
 
 - PSK (base64, 44 chars) and UUIDv4 formats are checked by option types.
 - Assertions: server tunnels need a key; client tunnels need ≥1 endpoint;
-  `privateKey` and `privateKeyFile` are mutually exclusive.
+  `privateKey` and `privateKeyFile` are mutually exclusive; `proxyRules`
+  entries need ≥1 syntactically valid CIDR and an
+  http/https/socks5/socks5h proxy URL.
 
 ### Tests
 
@@ -285,10 +326,13 @@ nix build .#checks.x86_64-linux.ripws-vm     # NixOS VM: kernel+userspace pair,
                                             # (~min, needs /dev/kvm)
 ```
 
-The VM test (`nix/vm-test.nix`) boots two NixOS guests running four tunnels
-(kernel↔kernel and userspace-server↔kernel-client), verifies config
-rendering/perms in `/run/ripws`, bidirectional connectivity, client restart
-with reconnect and interface cleanup, and recovery after a server restart.
+The VM test (`nix/vm-test.nix`) boots two NixOS guests running six tunnels
+(kernel↔kernel, userspace-server↔kernel-client, and a split-dataplane
+client with `proxyRules`), verifies config rendering/perms in `/run/ripws`,
+bidirectional connectivity, the SNI-`CONNECT` proxy path against a mock
+corporate proxy (domain-allow, IP-literal-deny), UDP refusal, kernel-path
+preservation, client restart with reconnect and interface cleanup, and
+recovery after a server restart.
 
 ---
 
@@ -545,6 +589,68 @@ sudo ripws up ws0.conf
 
 ---
 
+### 6. Split-Dataplane: Selected CIDRs through a Corporate Proxy
+
+Typical restricted-egress deployment (e.g. an office VPN endpoint that may
+only reach the internet via a Squid proxy): the `ripws` client runs in
+**kernel** mode so SSH/ICMP/10.x transit keep full-speed TUN performance,
+while Microsoft-365-style global ranges are intercepted in-process and
+`CONNECT`ed through the proxy — using the real hostname (TLS SNI) so the
+proxy's domain ACLs and audit logs work.
+
+```
+Server (kernel TUN, routes MS ranges into the tunnel)
+   │  AllowedIPs = 10.7.0.2/32, 20.20.32.0/19, 40.126.0.0/18
+   │  WebSocket ws://server:8080
+Client (kernel TUN + split proxy rules, e.g. k-iijima)
+   ├─ 10.x / SSH / ICMP ─────────────▶ kernel TUN (unchanged)
+   └─ 20.20.32.0/19, 40.126.0.0/18 ──▶ in-process netstack
+                                         └─ peek TLS SNI → CONNECT <host>:443
+                                            → http://proxy.corp:8080 (Squid)
+```
+
+```ini
+# client ws0.conf
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = kernel
+
+[Peer]
+UUID       = $UUID
+Endpoint   = ws://server:8080
+AllowedIPs = 10.7.0.0/24          # kernel routes stay minimal: do NOT add the MS ranges
+
+[ProxyRule]
+CIDRs = 20.20.32.0/19,20.190.128.0/18,20.231.128.0/19,40.126.0.0/18
+Proxy = http://proxy.corp:8080
+SNI   = true
+```
+
+On the client the MS ranges are **not** in any kernel route — the split
+interception happens before the kernel sees the packets. Because
+`AllowedIPs` stays at `10.7.0.0/24`, the proxy itself remains reachable via
+the host's default route (no loop).
+
+NixOS:
+
+```nix
+services.ripws.tunnels.client.proxyRules = [
+  {
+    cidrs = [ "20.20.32.0/19" "20.190.128.0/18" "20.231.128.0/19" "40.126.0.0/18" ];
+    proxy = "http://proxy.corp:8080";
+    sni   = true;
+  }
+];
+```
+
+> **IP-literal CONNECTs:** some proxies refuse `CONNECT <IP>:443`
+> (measured: Squid `SSL_ports` allowed 443 but rejected port 80). Set
+> `SNI = true` to send hostnames; flows without a parseable SNI still fall
+> back to the IP literal.
+
+---
+
 ## Test Scripts
 
 | Script | Description |
@@ -624,7 +730,7 @@ flake.nix                    buildGoModule (static binary), nixosModules, checks
 nix/                         module.nix (NixOS), package.nix, eval-test.nix, vm-test.nix
 internal/
   config/                    credentials, PSK validation (SPEC 2.2)
-    quickconf.go             wg-quick-compatible INI parser (Mode, NAT fields)
+    quickconf.go             wg-quick-compatible INI parser (Mode, NAT, [ProxyRule])
   proto/                     IP-version nibble, keep-alive, exponential backoff
   tunnel/
     tunnel.go                Interface abstract contract
@@ -632,6 +738,10 @@ internal/
     netstack.go              gVisor userspace backend (netstack)
     setup_linux.go           wg-quick-style ifup/ifdown (addr/MTU/routes/DNS/hooks)
     nat.go                   userspace NAT gateway (gVisor Forwarder → net.Dial)
+    split.go                 split-dataplane: [ProxyRule] interception + fan-in
+    rules.go                 ProxyRule validation + longest-prefix matcher
+    proxy.go                 HTTP CONNECT / SOCKS5(h) proxy dialer
+    sni.go                   TLS ClientHello SNI parser (stdlib, hardened)
   pipe/                      bidirectional TUN↔WS proxy + buffer pool
   server/                    Silent Drop (hijack + SO_LINGER=0) + WS upgrade
   client/                    dial + reconnect + jittered ping

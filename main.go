@@ -101,6 +101,13 @@ up / down:
     Endpoint   = URL        client: ws(s)://host:port
     PersistentKeepalive = N seconds (WebSocket Ping interval, 30..300)
 
+  [ProxyRule] section (repeatable):
+    CIDRs      = CIDR       (repeatable) dsts intercepted in-process (bypass kernel TUN)
+    Proxy      = URL        http(s):// or socks5(h):// upstream proxy (optional user:pass@)
+    SNI        = true|false peek TLS ClientHello and CONNECT <sni>:<port>
+              longest-prefix match wins; UDP to matched CIDRs is refused;
+              non-TLS or SNI-less flows fall back to CONNECT <dstIP>:<port>
+
   kernel mode requires CAP_NET_ADMIN + /dev/net/tun.
   userspace mode requires no privileges.
 

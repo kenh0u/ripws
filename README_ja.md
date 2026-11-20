@@ -9,6 +9,7 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
   - `kernel` — ホストTUNデバイス（`songgao/water`）、`CAP_NET_ADMIN` + `/dev/net/tun` 必要（wg-quick互換）
   - `userspace` — gVisor netstackインプロセス、**権限不要・TUN不要**（Tailscale互換）
 - **Userspace NATゲートウェイ** — トンネル通過トランジットトラフィックをホスト側ネットワークへ透過的にNAT転送（`net.Dial`）、権限不要
+- **Split-Dataplane `[ProxyRule]`** — 指定宛先CIDRだけをカーネルTUNを迂回してインプロセスでL4終端し、HTTP `CONNECT` / SOCKS5プロキシへ送出。TLS SNI抽出で企業プロキシのドメインACL・監査ログとも共存。`Mode = kernel` の既存性能（SSH/ICMP/`10.x`）は一切壊さない
 - 双方向ゴルーチンプロキシパイプ（`TUN ↔ WS`）、`sync.Pool`バッファ、IPバージョンニブル検証
 - WebSocket Ping/Pongキープアライブ（30–300秒、ジッター付き）、サーバー読み取りウィンドウ ≥ 最遅Ping
 - 指数バックオフ + フルジッター再接続
@@ -30,6 +31,7 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
   - [3. ユーザースペース NATゲートウェイ](#3-ユーザースペース-natゲートウェイ)
   - [4. Cloudflare Tunnel経由 (wss://)](#4-cloudflare-tunnel経由-wss)
   - [5. 複数クライアント（個別PSK）](#5-複数クライアント個別psk)
+  - [6. Split-Dataplane: 指定CIDRのみ社内プロキシ経由](#6-split-dataplane-指定cidrのみ社内プロキシ経由)
 - [テストスクリプト](#テストスクリプト)
 - [Dockerテスト](#dockerテスト)
 - [プロジェクトレイアウト](#プロジェクトレイアウト)
@@ -149,6 +151,29 @@ INI形式で `[Interface]` セクションと複数の `[Peer]` セクション�
 | `Endpoint` | clientのみ | `ws(s)://host:port` サーバーURL（UUIDは自動でパスに追加） |
 | `PersistentKeepalive` | (省略可) | WebSocket Ping間隔（秒、30〜300） |
 
+### [ProxyRule] セクション（複数回記述可）
+
+宛先IPが `CIDRs` に一致するパケットはカーネルTUNを一切経由せず、インプロセス（gVisor netstack）でL4終端され、上部プロキシへ新しいTCPコネクションとして転送されます。それ以外（`AllowedIPs` ルート、SSH、ICMP、`10.x` トランジット）は従来通りカーネル経路のまま一切壊れません。`Mode = kernel` / `userspace` 両方で動作します。
+
+| フィールド | 必須 | 説明 |
+|-----------|------|------|
+| `CIDRs` | ✓ | 遮断対象の宛先CIDR（カンマ区切り、IPv4/IPv6） |
+| `Proxy` | ✓ | `http://` `https://` `socks5://` `socks5h://` URL（`user:pass@` 可） |
+| `SNI` | (デフォルト `false`) | TLS ClientHelloを先読みし `CONNECT <dstIP>` ではなく `CONNECT <sni>:<port>` を使用 |
+
+```ini
+[ProxyRule]
+CIDRs = 20.20.32.0/19,20.190.128.0/18,40.126.0.0/18
+Proxy = http://proxy.corp:8080
+SNI   = true
+```
+
+ルールが複数の場合、**最長プレフィックス一致**が優先（同一長は先勝ち）。注意:
+
+- 一致CIDR宛の **UDP** は即時拒否（HTTPプロキシはTCPのみ。QUICクライアントはハングせずTCPへフォールバック）。
+- `SNI = true` でも、非TLS・SNIなし・先読みタイムアウト（500ms）は `CONNECT <dstIP>:<port>` へフォールバック。
+- プロキシ自身のIPを `CIDRs` に入れてはいけません（自身へループする）。プロキシへの接続はホストの通常経路で行われます。
+
 ### WireGuardとの対応関係
 
 | WireGuard | RIPWS | 備考 |
@@ -238,6 +263,9 @@ services.ripws.tunnels.client = {
 | `preStart` / `postStart` | `""` | systemdフック |
 | `autoStart` | `true` | ブート時有効化 |
 | `proxyEnvironment` | `{ }` | ユニットの `Environment` |
+| `proxyRules[].cidrs` | — | `[ProxyRule]` の `CIDRs` |
+| `proxyRules[].proxy` | — | `[ProxyRule]` の `Proxy` |
+| `proxyRules[].sni` | `false` | `[ProxyRule]` の `SNI` |
 | `extraPackages` | `[ ]` | サービスのPATH |
 
 ### 秘密情報の取り扱い
@@ -259,7 +287,7 @@ nix build .#checks.x86_64-linux.ripws-vm     # NixOS VMテスト: kernel+userspa
                                             # 疎通・再起動・後始末（要/dev/kvm）
 ```
 
-VMテスト（`nix/vm-test.nix`）は2台のNixOSゲストに4トンネル（kernel↔kernel、userspaceサーバー↔kernelクライアント）を起動し、`/run/ripws` の設定レンダリングと権限、双方向ping、クライアント再起動時の再接続とインターフェース後始末、サーバー再起動後の回復を検証します。
+VMテスト（`nix/vm-test.nix`）は2台のNixOSゲストに6トンネル（kernel↔kernel、userspaceサーバー↔kernelクライアント、`proxyRules` 付きsplit-dataplaneクライアント）を起動し、`/run/ripws` の設定レンダリングと権限、双方向ping、モック社内プロキシ（ドメイン許可・IPリテラル拒否）に対するSNI CONNECTプロキシ経路、UDP遮断、カーネル経路の不変性、クライアント再起動時の再接続とインターフェース後始末、サーバー再起動後の回復を検証します。
 
 ---
 
@@ -503,6 +531,60 @@ sudo ripws up ws0.conf
 
 ---
 
+### 6. Split-Dataplane: 指定CIDRのみ社内プロキシ経由
+
+送出制限の強い環境（例: 社内VPN終端がSquidプロキシ経由でしか外部に出られない）向けの定石構成。`ripws` クライアントは **kernel** モードのままSSH/ICMP/`10.x` トランジットのフルスピードを維持し、Microsoft 365系のグローバル帯だけインプロセスで遮断して `CONNECT` でプロキシへ流します。TLS SNI を抽出して実ホスト名で `CONNECT` するため、プロキシ側のドメインACL・監査ログもそのまま機能します。
+
+```
+サーバー (kernel TUN、MS帯をトンネルへルート)
+   │  AllowedIPs = 10.7.0.2/32, 20.20.32.0/19, 40.126.0.0/18
+   │  WebSocket ws://server:8080
+クライアント (kernel TUN + split proxy rules)
+   ├─ 10.x / SSH / ICMP ─────────────▶ カーネルTUN（従来通り）
+   └─ 20.20.32.0/19, 40.126.0.0/18 ──▶ インプロセス netstack
+                                         └─ TLS SNI 抽出 → CONNECT <host>:443
+                                            → http://proxy.corp:8080 (Squid)
+```
+
+```ini
+# クライアント ws0.conf
+[Interface]
+Address    = 10.7.0.2/24
+PrivateKey = $PSK
+Mode       = kernel
+
+[Peer]
+UUID       = $UUID
+Endpoint   = ws://server:8080
+AllowedIPs = 10.7.0.0/24          # カーネルルートは最小限: MS帯をここに入れないこと
+
+[ProxyRule]
+CIDRs = 20.20.32.0/19,20.190.128.0/18,20.231.128.0/19,40.126.0.0/18
+Proxy = http://proxy.corp:8080
+SNI   = true
+```
+
+クライアント側ではMS帯はどのカーネルルートにも現れません（遮断はカーネルが見る前に完了）。`AllowedIPs` が `10.7.0.0/24` のままなので、プロキシ自体はホストのデフォルトルートで到達可能で、ループしません。
+
+NixOS:
+
+```nix
+services.ripws.tunnels.client.proxyRules = [
+  {
+    cidrs = [ "20.20.32.0/19" "20.190.128.0/18" "20.231.128.0/19" "40.126.0.0/18" ];
+    proxy = "http://proxy.corp:8080";
+    sni   = true;
+  }
+];
+```
+
+> **IPリテラル CONNECT:** プロキシによっては `CONNECT <IP>:443` を拒否します
+> （実測: Squidは `SSL_ports` の443は許可、80番のCONNECTは403）。
+> `SNI = true` でホスト名を送れば回避できます。SNIが解析できないフローは
+> IPリテラルへフォールバックします。
+
+---
+
 ## テストスクリプト
 
 | スクリプト | 内容 |
@@ -578,7 +660,7 @@ flake.nix                    buildGoModule（静的バイナリ）、nixosModule
 nix/                         module.nix（NixOS）、package.nix、eval-test.nix、vm-test.nix
 internal/
   config/                    認証情報、PSKバリデーション (SPEC 2.2)
-    quickconf.go             wg-quick互換INIパーサー（Mode, NATフィールド対応）
+    quickconf.go             wg-quick互換INIパーサー（Mode, NAT, [ProxyRule]対応）
   proto/                     IPバージョンニブル、キープアライブ、指数バックオフ
   tunnel/
     tunnel.go                Interface 抽象契約
@@ -586,6 +668,10 @@ internal/
     netstack.go              gVisor userspace バックエンド (netstack)
     setup_linux.go           wg-quick風 ifup/ifdown (addr/MTU/routes/DNS/hooks)
     nat.go                   userspace NATゲートウェイ (gVisor Forwarder → net.Dial)
+    split.go                 split-dataplane: [ProxyRule] 遮断 + fan-in
+    rules.go                 ProxyRule バリデーション + 最長プレフィックス一致
+    proxy.go                 HTTP CONNECT / SOCKS5(h) プロキシダイアラ
+    sni.go                   TLS ClientHello SNIパーサー（標準ライブラリのみ）
   pipe/                      双方向 TUN↔WS プロキシ + バッファプール
   server/                    Silent Drop (hijack + SO_LINGER=0) + WS upgrade
   client/                    dial + reconnect + jittered ping

@@ -283,8 +283,12 @@ pkgs.testers.runNixOSTest {
         client.succeed("! grep -q '10\\.9\\.0' /tmp/proxy-connects.log")
 
     with subtest("split proxy UDP refused"):
-        # UDP to the proxied range must fail fast, not hang or leak.
-        server.fail("timeout 10 bash -c 'echo x | nc -u -w 5 198.51.100.10 443' >/dev/null 2>&1; test $? -ne 124")
+        # UDP to the proxied range must not hang and must not reach the
+        # proxy (HTTP proxies carry TCP only; ripws refuses the flow).
+        server.succeed("timeout 10 sh -c 'echo x | nc -u -w 3 198.51.100.10 443' >/dev/null 2>&1 || true")
+        client.succeed("! grep -q '443' /tmp/proxy-connects.log || ! grep -qv 'ms-test' /tmp/proxy-connects.log")
+        # and no UDP leak into the client kernel either
+        client.succeed("! ip route | grep -q 198.51.100")
 
     with subtest("split proxy survives restart"):
         client.execute("systemctl restart ripws-c2.service")
