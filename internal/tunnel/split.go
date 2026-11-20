@@ -294,16 +294,19 @@ func (u *Userspace) EnableNATWithRules(logger *log.Logger, rules []*ProxyRule, m
 }
 
 // startEgressLoop bridges the netstack's NIC egress back to its inbound
-// path. A local socket dialing a proxied destination emits a packet out the
-// only NIC; re-injecting it as inbound makes the stack treat the destination
-// as "on the wire", where the forwarder terminates the flow at the proxy.
-// Without this loop the SYN just sits in the link queue and the dial hangs.
+// path — but only for packets where one end is a local address. Local
+// sockets (gonet dials) emit their SYNs and receive their SYN-ACKs through
+// the NIC; re-injecting those lets the promiscuous NIC deliver them to the
+// forwarder or the socket. Transit packets between the tunnel peer and the
+// proxied CIDRs (neither end local) must NOT be re-injected — the stack
+// would forward them back out (HandleLocal=false) and loop forever; they
+// are only forwarded to the WebSocket via the sink.
 func (u *Userspace) startEgressLoop() {
 	u.startEgressLoopPkt(nil)
 }
 
 // startEgressLoopPkt is startEgressLoop with an optional sink that receives
-// every looped packet (the SplitInterface forwards them to the WebSocket).
+// every egress packet (the SplitInterface forwards them to the WebSocket).
 func (u *Userspace) startEgressLoopPkt(sink chan<- []byte) {
 	u.loopOnce.Do(func() {
 		go func() {
@@ -315,7 +318,9 @@ func (u *Userspace) startEgressLoopPkt(sink chan<- []byte) {
 				}
 				pkt := make([]byte, n)
 				copy(pkt, buf[:n])
-				_, _ = u.WritePacket(pkt)
+				if u.hasLocalEndpoint(pkt) {
+					_, _ = u.WritePacket(pkt)
+				}
 				if sink != nil {
 					select {
 					case sink <- pkt:
@@ -325,6 +330,36 @@ func (u *Userspace) startEgressLoopPkt(sink chan<- []byte) {
 			}
 		}()
 	})
+}
+
+// hasLocalEndpoint reports whether the packet's source or destination IP is
+// one of the tunnel's own addresses: traffic between a local socket and the
+// netstack's forwarder, as opposed to transit between the tunnel peer and a
+// proxied CIDR.
+func (u *Userspace) hasLocalEndpoint(pkt []byte) bool {
+	if len(pkt) == 0 {
+		return false
+	}
+	var src, dst netip.Addr
+	switch pkt[0] >> 4 {
+	case 4:
+		if len(pkt) < 20 {
+			return false
+		}
+		src = netip.AddrFrom4([4]byte(pkt[12:16]))
+		dst = netip.AddrFrom4([4]byte(pkt[16:20]))
+	case 6:
+		if len(pkt) < 40 {
+			return false
+		}
+		src = netip.AddrFrom16([16]byte(pkt[8:24]))
+		dst = netip.AddrFrom16([16]byte(pkt[24:40]))
+	default:
+		return false
+	}
+	_, s := u.localIPs[src.Unmap()]
+	_, d := u.localIPs[dst.Unmap()]
+	return s || d
 }
 
 // peekSNI reads the client's first bytes with a short deadline and extracts

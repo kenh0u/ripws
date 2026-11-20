@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -46,6 +47,7 @@ type Userspace struct {
 	stack    *stack.Stack
 	link     *channel.Endpoint
 	nicID    tcpip.NICID
+	localIPs map[netip.Addr]struct{}
 	mu       sync.Mutex
 	closed   bool
 	loopOnce sync.Once
@@ -116,7 +118,9 @@ func NewUserspaceMTU(localAddrs []string, routes []Route, mtu int) (*Userspace, 
 	}
 	s.SetRouteTable(rt)
 
-	return &Userspace{stack: s, link: ch, nicID: nicID}, nil
+	u := &Userspace{stack: s, link: ch, nicID: nicID}
+	u.rebuildLocalAddrSet(localAddrs)
+	return u, nil
 }
 
 // ReadPacket returns the next packet the netstack wants to emit on the tunnel
@@ -239,3 +243,14 @@ func parseSubnet(s string) (tcpip.Subnet, error) {
 }
 
 var _ Interface = (*Userspace)(nil)
+
+// rebuildLocalAddrSet refreshes the srcIsLocal filter from the plain-IP
+// address list (best-effort: unparsable entries are skipped).
+func (u *Userspace) rebuildLocalAddrSet(addrs []string) {
+	u.localIPs = make(map[netip.Addr]struct{}, len(addrs))
+	for _, a := range addrs {
+		if ip, err := netip.ParseAddr(a); err == nil {
+			u.localIPs[ip.Unmap()] = struct{}{}
+		}
+	}
+}
