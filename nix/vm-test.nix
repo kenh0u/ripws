@@ -21,6 +21,7 @@ let
   psk = "SCCEuJtqD1CFE7y9f332WQ6H9o7Lr5TgKQZ4E4Q8Fp0=";
   uuid0 = "550e8400-e29b-41d4-a716-446655440000";
   uuid1 = "6ba7b810-9dad-41d4-80b4-00c04fd430c8";
+  uuid2 = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
 in
 pkgs.testers.runNixOSTest {
   name = "ripws";
@@ -35,7 +36,13 @@ pkgs.testers.runNixOSTest {
           address = [ "10.7.0.1/24" ];
           listenPort = 8080;
           privateKey = psk;
-          peers = [ { uuid = uuid0; allowedIPs = [ "10.7.0.2/32" ]; } ];
+          peers = [
+            { uuid = uuid0; allowedIPs = [ "10.7.0.2/32" ]; }
+            # 198.51.100.0/24 (TEST-NET-2, standing in for the MS CIDRs) is
+            # routed into the tunnel toward c2, where its proxyRules
+            # intercept the range in-process.
+            { uuid = uuid2; allowedIPs = [ "10.7.0.3/32" "198.51.100.0/24" ]; }
+          ];
         };
         s1 = {
           mode = "userspace";
@@ -44,9 +51,7 @@ pkgs.testers.runNixOSTest {
           privateKeyFile = "/run/secrets/ripws-s1.key";
           # test fixture: provision the "secret" at service start
           preStart = "install -d -m 700 /run/secrets && echo '${psk}' > /run/secrets/ripws-s1.key";
-          # 198.51.100.0/24 is routed into the tunnel toward the client,
-          # where c2's proxyRules intercept it in-process.
-          peers = [ { uuid = uuid1; allowedIPs = [ "10.9.0.2/32" "10.7.0.3/32" "198.51.100.0/24" ]; } ];
+          peers = [ { uuid = uuid1; allowedIPs = [ "10.9.0.2/32" ]; } ];
         };
       };
     };
@@ -172,9 +177,9 @@ pkgs.testers.runNixOSTest {
           privateKeyFile = "/run/secrets/ripws-c2.key";
           preStart = "install -d -m 700 /run/secrets && echo '${psk}' > /run/secrets/ripws-c2.key";
           peers = [ {
-            uuid = uuid1;
-            endpoint = "ws://server:8081";
-            allowedIPs = [ "10.9.0.0/24" "10.7.0.0/24" ];
+            uuid = uuid2;
+            endpoint = "ws://server:8080";
+            allowedIPs = [ "10.7.0.0/24" ];
           } ];
           proxyRules = [ {
             cidrs = [ "198.51.100.0/24" ];
@@ -257,17 +262,18 @@ pkgs.testers.runNixOSTest {
     with subtest("split proxy SNI"):
         client.succeed("rm -f /tmp/proxy-connects.log")
         # kernel dataplane must still work alongside the proxy path
+        # (10.7.0.3 is c2's TUN address — served by the kernel, not the proxy)
         server.succeed("ping -c 2 -W 2 10.7.0.3")
-        server.succeed("ping -c 2 -W 2 10.9.0.2")
         # HTTPS to the "MS" range: SNI extracted, CONNECT ms-test.example.com
         out = server.succeed(
             "curl -s --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
         )
         assert "ok" in out, out
-        log = client.succeed("cat /tmp/proxy-connects.log")
-        assert "CONNECT ms-test.example.com:443" in log or "ms-test.example.com:443" in log, log
-        # the kernel path (ping) never shows up in the proxy log
-        assert "10.7.0" not in log and "10.9.0" not in log, log
+        connects = client.succeed("cat /tmp/proxy-connects.log")
+        assert "ms-test.example.com:443" in connects, connects
+        # the kernel path (ping/SSH) never shows up in the proxy log
+        client.succeed("! grep -q '10\\.7\\.0' /tmp/proxy-connects.log")
+        client.succeed("! grep -q '10\\.9\\.0' /tmp/proxy-connects.log")
 
     with subtest("split proxy UDP refused"):
         # UDP to the proxied range must fail fast, not hang or leak.
