@@ -290,6 +290,14 @@ pkgs.testers.runNixOSTest {
         # and no UDP leak into the client kernel either
         client.succeed("! ip route | grep -q 198.51.100")
 
+    with subtest("split proxy SNI-less fallback"):
+        # A silent (non-TLS) TCP flow must fall back to CONNECT <dstIP>:<port>
+        # after the peek timeout; the mock proxy denies it (403) but records
+        # the target.
+        client.succeed("rm -f /tmp/proxy-connects.log")
+        server.execute("timeout 15 sh -c 'nc -w 8 198.51.100.10 1443 < /dev/null' >/dev/null 2>&1 || true")
+        client.wait_until_succeeds("grep -q '198.51.100.10:1443' /tmp/proxy-connects.log", timeout=30)
+
     with subtest("split proxy survives restart"):
         client.execute("systemctl restart ripws-c2.service")
         client.wait_for_unit("ripws-c2.service")
