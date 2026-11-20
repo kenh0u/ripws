@@ -273,7 +273,7 @@ pkgs.testers.runNixOSTest {
         server.succeed("ping -c 2 -W 2 10.12.0.2")
         # HTTPS to the "MS" range: SNI extracted, CONNECT ms-test.example.com
         out = server.succeed(
-            "curl -s --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
+            "curl -sk --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
         )
         assert "ok" in out, out
         connects = client.succeed("cat /tmp/proxy-connects.log")
@@ -292,7 +292,7 @@ pkgs.testers.runNixOSTest {
         time.sleep(3)
         client.succeed("rm -f /tmp/proxy-connects.log")
         out = server.succeed(
-            "curl -s --max-time 30 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
+            "curl -sk --max-time 30 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
         )
         assert "ok" in out, out
 
