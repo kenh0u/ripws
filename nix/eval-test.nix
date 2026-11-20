@@ -159,6 +159,74 @@ let
           && lib.elem ''NO_PROXY="localhost"'' env;
     };
 
+    proxyRulesRendered = {
+      name = "proxyRules rendered into [ProxyRule] sections";
+      ok =
+        let e = eval [ {
+              services.ripws.tunnels.c0 = {
+                address = [ "10.7.0.2/24" ];
+                privateKey = psk;
+                peers = [ { inherit uuid; endpoint = "ws://h:8080"; } ];
+                proxyRules = [
+                  { cidrs = [ "20.20.32.0/19" "40.126.0.0/18" ]; proxy = "http://proxy.iiji.jp:8080"; sni = true; }
+                  { cidrs = [ "2001:db8::/32" ]; proxy = "socks5h://u:p@127.0.0.1:1080"; }
+                ];
+              };
+            } ];
+            s = execOf e "c0";
+        in
+          lib.strings.hasInfix "CIDRs = 20.20.32.0/19,40.126.0.0/18" s
+          && lib.strings.hasInfix "Proxy = http://proxy.iiji.jp:8080" s
+          && lib.strings.hasInfix "SNI = true" s
+          && lib.strings.hasInfix "CIDRs = 2001:db8::/32" s
+          && lib.strings.hasInfix "Proxy = socks5h://u:p@127.0.0.1:1080" s
+          && lib.strings.hasInfix "SNI = false" s;
+    };
+
+    proxyRulesEmptyRendersNothing = {
+      name = "empty proxyRules renders no [ProxyRule] section";
+      ok = !lib.strings.hasInfix "[ProxyRule]" (execOf (eval [ baseServer ]) "s0");
+    };
+
+    proxyRulesBadCidrFails = {
+      name = "proxyRules bad CIDR fails";
+      ok = !(builtins.tryEval (evalChecked [ {
+        services.ripws.tunnels.s0 = {
+          address = [ "10.7.0.1/24" ];
+          listenPort = 8080;
+          privateKey = psk;
+          peers = [ { inherit uuid; } ];
+          proxyRules = [ { cidrs = [ "20.20.32.0/33" ]; proxy = "http://p:8080"; } ];
+        };
+      } ])).success;
+    };
+
+    proxyRulesEmptyCidrsFails = {
+      name = "proxyRules empty cidrs fails";
+      ok = !(builtins.tryEval (evalChecked [ {
+        services.ripws.tunnels.s0 = {
+          address = [ "10.7.0.1/24" ];
+          listenPort = 8080;
+          privateKey = psk;
+          peers = [ { inherit uuid; } ];
+          proxyRules = [ { proxy = "http://p:8080"; } ];
+        };
+      } ])).success;
+    };
+
+    proxyRulesBadSchemeFails = {
+      name = "proxyRules bad proxy scheme fails";
+      ok = !(builtins.tryEval (evalChecked [ {
+        services.ripws.tunnels.s0 = {
+          address = [ "10.7.0.1/24" ];
+          listenPort = 8080;
+          privateKey = psk;
+          peers = [ { inherit uuid; } ];
+          proxyRules = [ { cidrs = [ "20.20.32.0/19" ]; proxy = "ftp://p:21"; } ];
+        };
+      } ])).success;
+    };
+
     prePostStartHooks = {
       name = "pre/postStart hook scripts";
       ok =
