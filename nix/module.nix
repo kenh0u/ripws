@@ -172,6 +172,43 @@ let
         description = "Peer entries.";
       };
 
+      proxyRules = mkOption {
+        type = types.listOf (types.submodule {
+          options = {
+            cidrs = mkOption {
+              type = with types; listOf str;
+              example = [ "20.20.32.0/19" "40.126.0.0/18" ];
+              description = "Destination CIDRs intercepted in-process and routed through the proxy.";
+            };
+            proxy = mkOption {
+              type = types.str;
+              example = "http://proxy.iiji.jp:8080";
+              description = "Upstream proxy URL (http://, https://, socks5://, socks5h://; user:pass@ supported).";
+            };
+            sni = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Peek the TLS ClientHello SNI and use it as the proxy CONNECT
+                target hostname; falls back to the destination IP on non-TLS
+                flows, missing SNI, or peek timeout.
+              '';
+            };
+          };
+        });
+        default = [ ];
+        description = ''
+          Split-dataplane proxy rules: packets to these CIDRs are terminated
+          in-process (gVisor netstack) and carried through the upstream proxy
+          instead of the kernel TUN — Mode = kernel is kept for everything
+          else (SSH, ICMP, 10.x transit all unchanged). UDP to matched CIDRs
+          is refused (HTTP/SOCKS-to-TCP proxies carry no UDP).
+
+          Note: never include the proxy server's own IP in cidrs — that would
+          loop its own connections back into itself.
+        '';
+      };
+
       proxyEnvironment = mkOption {
         type = types.attrsOf types.str;
         default = { };
@@ -232,6 +269,12 @@ let
         ${optionalString (p.endpoint != null) "Endpoint = ${p.endpoint}"}
         PersistentKeepalive = ${toString p.persistentKeepalive}
       '';
+      proxyRuleConf = r: ''
+        [ProxyRule]
+        CIDRs = ${concatStringsSep "," r.cidrs}
+        Proxy = ${r.proxy}
+        SNI = ${lib.boolToString r.sni}
+      '';
     in
     ''
       [Interface]
@@ -244,7 +287,9 @@ let
       Table = ${t.table}
       Mode = ${t.mode}
       ${optionalString t.nat "NAT = true"}
-    '' + concatStringsSep "\n" (imap1 peerConf t.peers);
+    '' + concatStringsSep "\n" (imap1 peerConf t.peers)
+    + optionalString (t.proxyRules != [ ]) "\n"
+    + concatStringsSep "\n" (map proxyRuleConf t.proxyRules);
 
   hasFileSecrets = t:
     t.privateKeyFile != null || lib.any (p: p.presharedKeyFile != null) t.peers;
@@ -325,7 +370,31 @@ in
           services.ripws.tunnels.${n}: set only one of
           privateKey / privateKeyFile.'';
       }
-    ]) cfg.tunnels);
+    ] ++ lib.concatLists (lib.imap0 (i: r: [
+      {
+        assertion = r.cidrs != [ ];
+        message = ''
+          services.ripws.tunnels.${n}.proxyRules.${toString i}: cidrs
+          must not be empty.'';
+      }
+      {
+        # Validate the textual shape (v4: a.b.c.d/p 0..32, v6: hex
+        # groups/p 0..128). The v6 branch requires a colon so v4 strings
+        # cannot sneak through it.
+        assertion = lib.all (c: c != ""
+          && (builtins.match "([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])" c != null
+              || builtins.match "[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+/([0-9]{1,2}|1[01][0-9]|12[0-8])" c != null)) r.cidrs;
+        message = ''
+          services.ripws.tunnels.${n}.proxyRules.${toString i}: all
+          cidrs must be valid IPv4/IPv6 CIDRs (e.g. "20.20.32.0/19").'';
+      }
+      {
+        assertion = builtins.match "(https?|socks5h?)://.*" r.proxy != null;
+        message = ''
+          services.ripws.tunnels.${n}.proxyRules.${toString i}: proxy
+          must be an http://, https://, socks5:// or socks5h:// URL.'';
+      }
+    ]) t.proxyRules)) cfg.tunnels);
 
     # /run/ripws holds the 0600 runtime configs and ripws pid files.
     systemd.tmpfiles.rules = [ "d /run/ripws 0700 root root -" ];

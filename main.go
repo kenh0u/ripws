@@ -174,15 +174,62 @@ func cmdUp(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	proxyRules, err := buildProxyRules(cfg)
+	must(err)
+
 	if cfg.IsUserspace() {
-		must(runUpUserspace(ctx, cfg, creds, ifName))
+		must(runUpUserspace(ctx, cfg, creds, ifName, proxyRules))
 	} else {
-		runUpKernel(ctx, cfg, creds, ifName)
+		runUpKernel(ctx, cfg, creds, ifName, proxyRules)
 	}
 }
 
+// buildProxyRules converts config [ProxyRule] sections into tunnel rules,
+// validating CIDRs and proxy URLs at load time.
+func buildProxyRules(cfg *config.QuickConfig) ([]*tunnel.ProxyRule, error) {
+	if len(cfg.ProxyRules) == 0 {
+		return nil, nil
+	}
+	rules := make([]*tunnel.ProxyRule, 0, len(cfg.ProxyRules))
+	for i := range cfg.ProxyRules {
+		r := &tunnel.ProxyRule{
+			CIDRs: cfg.ProxyRules[i].CIDRs,
+			Proxy: cfg.ProxyRules[i].Proxy,
+			SNI:   cfg.ProxyRules[i].SNI,
+		}
+		if err := r.Validate(); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, nil
+}
+
+// wrapSplit wraps tun with the in-process proxy dataplane when proxy rules
+// are configured; otherwise it returns tun unchanged (zero regression).
+func wrapSplit(tun tunnel.Interface, cfg *config.QuickConfig, rules []*tunnel.ProxyRule) tunnel.Interface {
+	if len(rules) == 0 {
+		return tun
+	}
+	localAddrs := make([]string, 0, len(cfg.Interface.Address))
+	for _, a := range cfg.Interface.Address {
+		if ip, _, err := net.ParseCIDR(a); err == nil {
+			localAddrs = append(localAddrs, ip.String())
+		} else {
+			localAddrs = append(localAddrs, a)
+		}
+	}
+	split, err := tunnel.NewSplit(tun, localAddrs, rules, cfg.Interface.MTU,
+		log.New(os.Stderr, "proxy: ", log.LstdFlags|log.Lmicroseconds))
+	if err != nil {
+		fatalf("up: proxy rules: %v", err)
+	}
+	log.Printf("up: split dataplane active (%d proxy rule(s))", len(rules))
+	return split
+}
+
 // runUpKernel brings up a kernel-mode tunnel (TUN + wg-quick-style config).
-func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string) {
+func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string, proxyRules []*tunnel.ProxyRule) {
 	tun, err := tunnel.NewKernel(ifName)
 	must(err)
 	defer tun.Close()
@@ -214,15 +261,18 @@ func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Cre
 		}
 	}()
 
+	// Split dataplane: proxy-rule CIDRs bypass the kernel TUN entirely.
+	split := wrapSplit(tun, cfg, proxyRules)
+
 	if cfg.IsServer() {
-		must(runServer(ctx, cfg, creds, tun))
+		must(runServer(ctx, cfg, creds, split))
 	} else {
-		must(runClient(ctx, cfg, tun))
+		must(runClient(ctx, cfg, split))
 	}
 }
 
 // runUpUserspace brings up a userspace-mode tunnel (gVisor netstack, no root).
-func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string) error {
+func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string, proxyRules []*tunnel.ProxyRule) error {
 	// Strip CIDR suffixes — NewUserspace takes plain IPs.
 	localAddrs := make([]string, 0, len(cfg.Interface.Address))
 	for _, a := range cfg.Interface.Address {
@@ -245,8 +295,16 @@ func runUpUserspace(ctx context.Context, cfg *config.QuickConfig, creds *config.
 
 	log.Printf("up: userspace netstack ready (addrs=%v routes=%v)", localAddrs, cfg.AllAllowedIPs())
 
-	// Optional NAT gateway.
-	if cfg.Interface.NAT {
+	// Optional NAT gateway, or split-proxy rules (which subsume NAT: the
+	// proxy dialer replaces net.Dial for matched CIDRs).
+	if len(proxyRules) > 0 {
+		matcherRules := proxyRules
+		if err := tun.EnableNATWithRules(
+			log.New(os.Stderr, "proxy: ", log.LstdFlags|log.Lmicroseconds),
+			matcherRules, nil); err != nil {
+			return fmt.Errorf("up: proxy rules: %w", err)
+		}
+	} else if cfg.Interface.NAT {
 		if err := tun.EnableNAT(log.New(os.Stderr, "nat: ", log.LstdFlags|log.Lmicroseconds)); err != nil {
 			log.Printf("up: NAT: %v", err)
 		}

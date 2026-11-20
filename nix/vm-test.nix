@@ -44,7 +44,9 @@ pkgs.testers.runNixOSTest {
           privateKeyFile = "/run/secrets/ripws-s1.key";
           # test fixture: provision the "secret" at service start
           preStart = "install -d -m 700 /run/secrets && echo '${psk}' > /run/secrets/ripws-s1.key";
-          peers = [ { uuid = uuid1; allowedIPs = [ "10.9.0.2/32" ]; } ];
+          # 198.51.100.0/24 is routed into the tunnel toward the client,
+          # where c2's proxyRules intercept it in-process.
+          peers = [ { uuid = uuid1; allowedIPs = [ "10.9.0.2/32" "10.7.0.3/32" "198.51.100.0/24" ]; } ];
         };
       };
     };
@@ -53,6 +55,102 @@ pkgs.testers.runNixOSTest {
       imports = [ ./module.nix ];
       networking.firewall.enable = false;
       services.ripws.package = ripwsPackage;
+
+      # --- mock corporate HTTP proxy (:8888) + TLS backend (:1443) ---------
+      # The proxy allows CONNECT to ms-test.example.com only (403 for IP
+      # literals and other hosts) and records every CONNECT target to
+      # /tmp/proxy-connects.log. The TLS backend serves HTTPS 200 "ok".
+      systemd.services.mock-proxy = {
+        description = "mock corporate HTTP proxy";
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 /etc/mock-proxy.py";
+      };
+      environment.etc."mock-proxy.py".text = ''
+        import socket, threading
+
+        ALLOWED_HOST = "ms-test.example.com"
+
+        def log(target):
+            with open("/tmp/proxy-connects.log", "a") as f:
+                f.write(target + "\n")
+
+        def handle(conn):
+            f = conn.makefile("rb")
+            target = None
+            while True:
+                line = f.readline()
+                if not line:
+                    conn.close(); return
+                line = line.decode(errors="replace").strip()
+                if line == "":
+                    break
+                parts = line.split()
+                if len(parts) == 3 and parts[0] == "CONNECT":
+                    target = parts[1]
+            if target is None:
+                conn.close(); return
+            log(target)
+            if target.rsplit(":", 1)[0] == ALLOWED_HOST:
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                try:
+                    up = socket.create_connection(("127.0.0.1", 1443), timeout=5)
+                    def pump(a, b):
+                        try:
+                            while True:
+                                d = a.recv(4096)
+                                if not d: break
+                                b.sendall(d)
+                        except OSError:
+                            pass
+                        finally:
+                            for x in (a, b):
+                                try: x.close()
+                                except OSError: pass
+                    threading.Thread(target=pump, args=(conn, up), daemon=True).start()
+                    pump(up, conn)
+                except OSError:
+                    conn.close()
+            else:
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                conn.close()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 8888))
+        srv.listen(64)
+        while True:
+            c, _ = srv.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+      '';
+      systemd.services.mock-tls = {
+        description = "mock TLS backend for ms-test.example.com";
+        wantedBy = [ "multi-user.target" ];
+        preStart = ''
+          ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /run/mock-tls-key.pem -out /run/mock-tls-cert.pem -days 2 \
+            -subj "/CN=ms-test.example.com" \
+            -addext "subjectAltName=DNS:ms-test.example.com" >/dev/null 2>&1
+          cat /run/mock-tls-key.pem /run/mock-tls-cert.pem > /run/mock-tls-combined.pem
+        '';
+        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 /etc/mock-tls.py";
+      };
+      environment.etc."mock-tls.py".text = ''
+        import http.server, ssl
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            def log_message(self, *a):
+                pass
+        httpd = http.server.HTTPServer(("127.0.0.1", 1443), H)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain("/run/mock-tls-combined.pem")
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        httpd.serve_forever()
+      '';
+
       services.ripws.tunnels = {
         c0 = {
           address = [ "10.7.0.2/24" ];
@@ -63,6 +161,25 @@ pkgs.testers.runNixOSTest {
             uuid = uuid0;
             endpoint = "ws://server:8080";
             allowedIPs = [ "10.7.0.1/32" ];
+          } ];
+        };
+        c2 = {
+          # Split-dataplane: 198.51.100.0/24 (TEST-NET-2, standing in for
+          # the MS CIDRs) is intercepted in-process and carried through the
+          # local mock proxy with SNI-based CONNECT; the kernel path (ping,
+          # plain TCP to 10.7.0.x) stays untouched.
+          address = [ "10.7.0.3/24" ];
+          privateKeyFile = "/run/secrets/ripws-c2.key";
+          preStart = "install -d -m 700 /run/secrets && echo '${psk}' > /run/secrets/ripws-c2.key";
+          peers = [ {
+            uuid = uuid1;
+            endpoint = "ws://server:8081";
+            allowedIPs = [ "10.9.0.0/24" "10.7.0.0/24" ];
+          } ];
+          proxyRules = [ {
+            cidrs = [ "198.51.100.0/24" ];
+            proxy = "http://127.0.0.1:8888";
+            sni = true;
           } ];
         };
         c1 = {
@@ -93,6 +210,9 @@ pkgs.testers.runNixOSTest {
     server.wait_for_unit("ripws-s1.service")
     client.wait_for_unit("ripws-c0.service")
     client.wait_for_unit("ripws-c1.service")
+    client.wait_for_unit("ripws-c2.service")
+    client.wait_for_unit("mock-proxy.service")
+    client.wait_for_unit("mock-tls.service")
 
     # --- runtime config files -------------------------------------------------
     with subtest("runtime config rendering"):
@@ -128,6 +248,40 @@ pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("ip addr show c1 | grep -q '10.9.0.2'", timeout=30)
         time.sleep(3)
         client.succeed("ping -c 3 -W 2 10.9.0.1")
+
+    # --- split-dataplane proxy + SNI E2E ---------------------------------------
+    # The 198.51.100.0/24 range exists nowhere on the VM network and the
+    # client has no route/ip_forward/NAT for it: if the packet reached the
+    # kernel, this test could never pass. Only the in-process gVisor proxy
+    # dataplane with SNI-based CONNECT can answer.
+    with subtest("split proxy SNI"):
+        client.succeed("rm -f /tmp/proxy-connects.log")
+        # kernel dataplane must still work alongside the proxy path
+        server.succeed("ping -c 2 -W 2 10.7.0.3")
+        server.succeed("ping -c 2 -W 2 10.9.0.2")
+        # HTTPS to the "MS" range: SNI extracted, CONNECT ms-test.example.com
+        out = server.succeed(
+            "curl -s --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
+        )
+        assert "ok" in out, out
+        log = client.succeed("cat /tmp/proxy-connects.log")
+        assert "CONNECT ms-test.example.com:443" in log or "ms-test.example.com:443" in log, log
+        # the kernel path (ping) never shows up in the proxy log
+        assert "10.7.0" not in log and "10.9.0" not in log, log
+
+    with subtest("split proxy UDP refused"):
+        # UDP to the proxied range must fail fast, not hang or leak.
+        server.fail("timeout 10 bash -c 'echo x | nc -u -w 5 198.51.100.10 443' >/dev/null 2>&1; test $? -ne 124")
+
+    with subtest("split proxy survives restart"):
+        client.execute("systemctl restart ripws-c2.service")
+        client.wait_for_unit("ripws-c2.service")
+        time.sleep(3)
+        client.succeed("rm -f /tmp/proxy-connects.log")
+        out = server.succeed(
+            "curl -s --max-time 30 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
+        )
+        assert "ok" in out, out
 
     # --- restart: clean teardown + reconnect -----------------------------------
     with subtest("restart reconnects"):

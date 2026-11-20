@@ -52,8 +52,8 @@ func (m *mockTun) WritePacket(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (m *mockTun) Name() string   { return "mock0" }
-func (m *mockTun) Close() error   { m.closed.Store(true); return nil }
+func (m *mockTun) Name() string { return "mock0" }
+func (m *mockTun) Close() error { m.closed.Store(true); return nil }
 
 type errClosedT struct{}
 

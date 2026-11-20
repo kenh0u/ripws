@@ -30,8 +30,18 @@ import (
 
 // QuickConfig is the parsed wg-quick-style configuration.
 type QuickConfig struct {
-	Interface InterfaceConfig
-	Peers     []PeerConfig
+	Interface  InterfaceConfig
+	Peers      []PeerConfig
+	ProxyRules []ProxyRuleConfig
+}
+
+// ProxyRuleConfig holds a [ProxyRule] section: destination CIDRs whose
+// traffic is intercepted in-process and carried through an upstream HTTP
+// CONNECT / SOCKS5 proxy instead of the normal datapath.
+type ProxyRuleConfig struct {
+	CIDRs []string // destination CIDRs (comma-separated, repeatable)
+	Proxy string   // http(s):// or socks5(h):// proxy URL
+	SNI   bool     // peek TLS ClientHello and CONNECT <sni>:<port>
 }
 
 // InterfaceConfig holds the [Interface] section values.
@@ -77,6 +87,7 @@ func LoadQuickConfig(path string) (*QuickConfig, error) {
 
 	var section string
 	var currentPeer *PeerConfig
+	var currentRule *ProxyRuleConfig
 
 	sc := bufio.NewScanner(f)
 	lineNo := 0
@@ -97,6 +108,10 @@ func LoadQuickConfig(path string) (*QuickConfig, error) {
 				section = "peer"
 				cfg.Peers = append(cfg.Peers, PeerConfig{})
 				currentPeer = &cfg.Peers[len(cfg.Peers)-1]
+			case "proxyrule":
+				section = "proxyrule"
+				cfg.ProxyRules = append(cfg.ProxyRules, ProxyRuleConfig{})
+				currentRule = &cfg.ProxyRules[len(cfg.ProxyRules)-1]
 			default:
 				return nil, fmt.Errorf("ripws: config line %d: unknown section [%s]", lineNo, section)
 			}
@@ -122,6 +137,13 @@ func LoadQuickConfig(path string) (*QuickConfig, error) {
 				return nil, fmt.Errorf("ripws: config line %d: peer field outside [Peer]", lineNo)
 			}
 			if err := cfg.setPeer(currentPeer, key, val, lineNo); err != nil {
+				return nil, err
+			}
+		case "proxyrule":
+			if currentRule == nil {
+				return nil, fmt.Errorf("ripws: config line %d: proxyrule field outside [ProxyRule]", lineNo)
+			}
+			if err := cfg.setProxyRule(currentRule, key, val, lineNo); err != nil {
 				return nil, err
 			}
 		default:
@@ -209,6 +231,24 @@ func (c *QuickConfig) setPeer(p *PeerConfig, key, val string, lineNo int) error 
 		p.PersistentKeepalive = k
 	default:
 		return fmt.Errorf("ripws: config line %d: unknown [Peer] key %q", lineNo, key)
+	}
+	return nil
+}
+
+func (c *QuickConfig) setProxyRule(r *ProxyRuleConfig, key, val string, lineNo int) error {
+	switch key {
+	case "cidrs", "cidr":
+		r.CIDRs = appendCSV(r.CIDRs, val)
+	case "proxy":
+		r.Proxy = val
+	case "sni":
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return fmt.Errorf("ripws: config line %d: bad SNI %q", lineNo, val)
+		}
+		r.SNI = b
+	default:
+		return fmt.Errorf("ripws: config line %d: unknown [ProxyRule] key %q", lineNo, key)
 	}
 	return nil
 }

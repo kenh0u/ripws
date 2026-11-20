@@ -43,11 +43,12 @@ type Route struct {
 
 // Userspace is a tunnel.Interface backed by an in-process gVisor netstack.
 type Userspace struct {
-	stack  *stack.Stack
-	link   *channel.Endpoint
-	nicID  tcpip.NICID
-	mu     sync.Mutex
-	closed bool
+	stack    *stack.Stack
+	link     *channel.Endpoint
+	nicID    tcpip.NICID
+	mu       sync.Mutex
+	closed   bool
+	loopOnce sync.Once
 }
 
 // NewUserspace creates a netstack with the given local addresses and routes.
