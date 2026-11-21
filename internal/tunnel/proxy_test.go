@@ -309,6 +309,50 @@ func TestProxyMatcherLongestPrefix(t *testing.T) {
 	}
 }
 
+func TestProxyMatcherMultiCIDRAndStability(t *testing.T) {
+	// Regression: a single ProxyRule with multiple CIDRs of differing prefix
+	// lengths must not panic during sorting or matching, and equal-length
+	// sorting must remain stable (first-configured rule wins).
+	ruleMulti := &ProxyRule{
+		CIDRs: []string{
+			"20.190.128.0/18",
+			"20.20.32.0/19",
+			"20.231.128.0/19",
+			"40.126.0.0/18",
+		},
+		Proxy: "http://proxy.corp:8080",
+		SNI:   true,
+	}
+	ruleFirst16 := &ProxyRule{CIDRs: []string{"10.99.0.0/16"}, Proxy: "http://first"}
+	ruleSecond16 := &ProxyRule{CIDRs: []string{"10.99.0.0/16"}, Proxy: "http://second"}
+	ruleMore24 := &ProxyRule{CIDRs: []string{"10.99.42.0/24"}, Proxy: "http://more"}
+
+	input := []*ProxyRule{ruleMulti, ruleFirst16, ruleSecond16, ruleMore24}
+	origOrder := append([]*ProxyRule(nil), input...)
+
+	m, err := newProxyMatcher(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range origOrder {
+		if input[i] != r {
+			t.Fatalf("newProxyMatcher mutated caller slice at index %d", i)
+		}
+	}
+
+	for _, ip := range []string{"20.190.141.37", "20.20.32.1", "20.231.128.1", "40.126.13.8", "::ffff:20.20.32.1"} {
+		if got := m.Match(mustAddr(ip)); got != ruleMulti {
+			t.Errorf("Match(%s) = %v, want ruleMulti", ip, got)
+		}
+	}
+	if got := m.Match(mustAddr("10.99.1.1")); got != ruleFirst16 {
+		t.Errorf("equal-length tie Match(10.99.1.1) = %v, want ruleFirst16", got)
+	}
+	if got := m.Match(mustAddr("10.99.42.1")); got != ruleMore24 {
+		t.Errorf("longer-prefix Match(10.99.42.1) = %v, want ruleMore24", got)
+	}
+}
+
 func b64(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }

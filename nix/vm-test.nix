@@ -45,10 +45,10 @@ pkgs.testers.runNixOSTest {
           address = [ "10.12.0.1/24" ];
           listenPort = 8082;
           privateKey = psk;
-          # 198.51.100.0/24 (TEST-NET-2, standing in for the MS CIDRs) is
-          # routed into the tunnel toward c2, where its proxyRules intercept
-          # the range in-process.
-          peers = [ { uuid = uuid2; allowedIPs = [ "10.12.0.2/32" "198.51.100.0/24" ]; } ];
+          # 198.51.100.0/24 and 203.0.113.0/25 (TEST-NET-2/3, standing in for
+          # the MS CIDRs) are routed into the tunnel toward c2, where its
+          # proxyRules intercept both ranges in-process.
+          peers = [ { uuid = uuid2; allowedIPs = [ "10.12.0.2/32" "198.51.100.0/24" "203.0.113.0/25" ]; } ];
         };
         s1 = {
           mode = "userspace";
@@ -188,7 +188,7 @@ pkgs.testers.runNixOSTest {
             allowedIPs = [ "10.12.0.0/24" ];
           } ];
           proxyRules = [ {
-            cidrs = [ "198.51.100.0/24" ];
+            cidrs = [ "198.51.100.0/24" "203.0.113.0/25" ];
             proxy = "http://127.0.0.1:8888";
             sni = true;
           } ];
@@ -271,11 +271,13 @@ pkgs.testers.runNixOSTest {
         # kernel dataplane must still work alongside the proxy path
         # (10.12.0.2 is c2's TUN address — served by the kernel, not the proxy)
         server.succeed("ping -c 2 -W 2 10.12.0.2")
-        # HTTPS to the "MS" range: SNI extracted, CONNECT ms-test.example.com
-        out = server.succeed(
-            "curl -sk --max-time 20 --resolve ms-test.example.com:443:198.51.100.10 https://ms-test.example.com/"
-        )
-        assert "ok" in out, out
+        # HTTPS to both "MS" ranges (varying prefix lengths in one ProxyRule):
+        # SNI extracted, CONNECT ms-test.example.com
+        for dst_ip in ("198.51.100.10", "203.0.113.10"):
+            out = server.succeed(
+                f"curl -sk --max-time 20 --resolve ms-test.example.com:443:{dst_ip} https://ms-test.example.com/"
+            )
+            assert "ok" in out, out
         connects = client.succeed("cat /tmp/proxy-connects.log")
         assert "ms-test.example.com:443" in connects, connects
         # the kernel path (ping/SSH) never shows up in the proxy log

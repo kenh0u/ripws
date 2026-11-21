@@ -3,8 +3,10 @@
 package tunnel
 
 import (
+	"cmp"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 )
 
@@ -49,43 +51,44 @@ func (r *ProxyRule) proxyScheme() string {
 	return strings.ToLower(r.Proxy[:i])
 }
 
+type proxyEntry struct {
+	prefix netip.Prefix
+	rule   *ProxyRule
+}
+
 // proxyMatcher compiles proxy rules into a longest-prefix-match table.
 type proxyMatcher struct {
-	// prefixes sorted by descending bits; within the same length the first
-	// configured rule wins (scan order).
-	prefixes []netip.Prefix
-	rules    []*ProxyRule
+	// entries sorted by descending prefix bits; stable sort preserves
+	// first-configured order among equal lengths.
+	entries []proxyEntry
 }
 
 func newProxyMatcher(rules []*ProxyRule) (*proxyMatcher, error) {
-	m := &proxyMatcher{rules: rules}
+	m := &proxyMatcher{}
 	for _, r := range rules {
 		for _, c := range r.CIDRs {
 			p, err := netip.ParsePrefix(c)
 			if err != nil {
 				return nil, err
 			}
-			m.prefixes = append(m.prefixes, p.Masked())
+			m.entries = append(m.entries, proxyEntry{
+				prefix: p.Masked(),
+				rule:   r,
+			})
 		}
 	}
-	// Sort by prefix length descending (longest prefix match); a stable sort
-	// keeps first-configured order among equal lengths.
-	for i := 0; i < len(m.prefixes); i++ {
-		for j := i + 1; j < len(m.prefixes); j++ {
-			if m.prefixes[j].Bits() > m.prefixes[i].Bits() {
-				m.prefixes[i], m.prefixes[j] = m.prefixes[j], m.prefixes[i]
-				m.rules[i], m.rules[j] = m.rules[j], m.rules[i]
-			}
-		}
-	}
+	slices.SortStableFunc(m.entries, func(a, b proxyEntry) int {
+		return cmp.Compare(b.prefix.Bits(), a.prefix.Bits())
+	})
 	return m, nil
 }
 
 // Match returns the rule for dst via longest prefix match, or nil.
 func (m *proxyMatcher) Match(dst netip.Addr) *ProxyRule {
-	for i, p := range m.prefixes {
-		if p.Contains(dst) {
-			return m.rules[i]
+	dst = dst.Unmap()
+	for _, e := range m.entries {
+		if e.prefix.Contains(dst) {
+			return e.rule
 		}
 	}
 	return nil
