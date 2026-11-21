@@ -76,6 +76,27 @@ func (k KeepAlive) ReadWindow() time.Duration {
 	return iv + pt
 }
 
+// InstallHandlers wires both Pong and Ping handlers on conn so any received
+// keep-alive control frame (Pong on a pinging client, or Ping on the passive
+// server) extends the read deadline by ReadWindow. The wrapped Ping handler
+// preserves gorilla/websocket's default Pong reply. It returns the initial
+// deadline that should be armed immediately afterwards.
+func (k KeepAlive) InstallHandlers(conn *websocket.Conn) time.Time {
+	window := k.ReadWindow()
+	k.InstallPongHandler(conn)
+	origPing := conn.PingHandler()
+	conn.SetPingHandler(func(appData string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+			return err
+		}
+		if origPing != nil {
+			return origPing(appData)
+		}
+		return nil
+	})
+	return time.Now().Add(window)
+}
+
 // InstallPongHandler wires a Pong handler on conn that extends the read
 // deadline by ReadWindow on every Pong received. It returns the deadline that
 // should be armed immediately afterwards.

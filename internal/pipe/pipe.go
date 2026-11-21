@@ -66,8 +66,9 @@ func Run(ctx context.Context, t tunnel.Interface, conn *websocket.Conn, opts Opt
 		ka = proto.DefaultKeepAlive()
 	}
 
-	deadline := ka.InstallPongHandler(conn)
+	deadline := ka.InstallHandlers(conn)
 	_ = conn.SetReadDeadline(deadline)
+	readWindow := ka.ReadWindow()
 
 	// Limit incoming frame size to one MTU; the protocol carries raw IP
 	// packets only, so anything larger is malformed or an attack.
@@ -126,6 +127,7 @@ func Run(ctx context.Context, t tunnel.Interface, conn *websocket.Conn, opts Opt
 				fail("ws-read", err)
 				return
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(readWindow))
 			if _, vErr := proto.IPVersion(data); vErr != nil {
 				continue
 			}

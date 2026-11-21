@@ -2,6 +2,8 @@ package pipe
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -149,5 +151,118 @@ func TestPipeNoGoroutineLeak(t *testing.T) {
 		// good: Run returned promptly despite the blocked tun read
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after ctx cancel (tun reader goroutine leak / deadlock)")
+	}
+}
+
+func startKeepAliveServer(t *testing.T, window time.Duration) (*mockTun, *websocket.Conn, <-chan error) {
+	t.Helper()
+	tun := newMockTun()
+	srvDone := make(chan error, 1)
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		srvDone <- Run(r.Context(), tun, conn, Options{
+			KeepAlive: proto.KeepAlive{Window: window},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+srv.URL[4:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return tun, client, srvDone
+}
+
+// TestPipeServerKeepAliveExtendsOnPing verifies that a passive server pipe
+// (Interval=0) extends its read deadline when receiving client WebSocket Pings
+// and does not drop an idle-but-pinging session after Window elapses.
+func TestPipeServerKeepAliveExtendsOnPing(t *testing.T) {
+	tun, client, srvDone := startKeepAliveServer(t, 120*time.Millisecond)
+
+	pongs := make(chan struct{}, 16)
+	client.SetPongHandler(func(string) error {
+		select {
+		case pongs <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	go func() {
+		for {
+			if _, _, err := client.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Send Pings for ~300ms (>2.5x Window) with zero data traffic.
+	for range 8 {
+		if err := client.WriteControl(websocket.PingMessage, []byte("ka"), time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("send ping: %v", err)
+		}
+		select {
+		case err := <-srvDone:
+			t.Fatalf("server pipe exited prematurely while pinging: %v", err)
+		case <-pongs:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for pong from server")
+		}
+		time.Sleep(35 * time.Millisecond)
+	}
+
+	// Verify data plane still delivers packets after surviving >2.5x Window.
+	if err := client.WriteMessage(websocket.BinaryMessage, valid4); err != nil {
+		t.Fatalf("write binary after pings: %v", err)
+	}
+	select {
+	case got := <-tun.inCh:
+		if len(got) != len(valid4) {
+			t.Fatalf("got %d bytes, want %d", len(got), len(valid4))
+		}
+	case err := <-srvDone:
+		t.Fatalf("server pipe exited instead of forwarding packet: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for packet on tun")
+	}
+}
+
+// TestPipeKeepAliveExtendsOnData verifies that receiving data frames extends
+// the read deadline even when no Ping/Pong frames are exchanged.
+func TestPipeKeepAliveExtendsOnData(t *testing.T) {
+	tun, client, srvDone := startKeepAliveServer(t, 120*time.Millisecond)
+
+	for i := range 8 {
+		if err := client.WriteMessage(websocket.BinaryMessage, valid4); err != nil {
+			t.Fatalf("write packet %d: %v", i, err)
+		}
+		select {
+		case <-tun.inCh:
+		case err := <-srvDone:
+			t.Fatalf("server pipe exited prematurely under data traffic: %v", err)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for packet %d", i)
+		}
+		time.Sleep(35 * time.Millisecond)
+	}
+}
+
+// TestPipeKeepAliveTimesOutWhenSilent ensures a dead/silent peer still trips
+// the read deadline once Window elapses.
+func TestPipeKeepAliveTimesOutWhenSilent(t *testing.T) {
+	_, _, srvDone := startKeepAliveServer(t, 100*time.Millisecond)
+
+	select {
+	case err := <-srvDone:
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("expected timeout error from silent peer, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("silent server pipe did not time out within 2s")
 	}
 }
