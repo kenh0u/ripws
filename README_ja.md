@@ -45,8 +45,10 @@ L3の生IPパケットをWebSocketバイナリフレームでトンネリング�
 ### Nix flake（推奨）
 
 ```sh
-nix build .#ripws          # -> result/bin/ripws (静的Goバイナリ, CGO無効)
-nix develop                # go / gopls が使える開発シェル
+nix build .#ripws                # -> result/bin/ripws (静的Goバイナリ, CGO無効)
+nix build .#ripws-openbsd-amd64  # -> result/bin/ripws (OpenBSD amd64 バイナリ)
+nix build .#ripws-openbsd-arm64  # -> result/bin/ripws (OpenBSD arm64 バイナリ)
+nix develop                      # go / gopls が使える開発シェル
 ```
 
 `flake.nix` は `buildGoModule` を使用。gVisorバージョンは `go.mod` でピン留め。
@@ -57,6 +59,9 @@ nix develop                # go / gopls が使える開発シェル
 
 ```sh
 CGO_ENABLED=0 go build -o ripws .
+# OpenBSD 向けクロスコンパイル（Cクロスコンパイラ不要）:
+CGO_ENABLED=0 GOOS=openbsd GOARCH=amd64 go build -o ripws-openbsd-amd64 .
+CGO_ENABLED=0 GOOS=openbsd GOARCH=arm64 go build -o ripws-openbsd-arm64 .
 ```
 
 ---
@@ -194,7 +199,7 @@ SNI   = true
 
 ### カーネル・ユーザースペースモード切替
 
-- `Mode = kernel`（デフォルト）→ ホストTUNデバイスを使用、`CAP_NET_ADMIN` + `/dev/net/tun` 必要
+- `Mode = kernel`（デフォルト）→ ホストTUNデバイスを使用（Linuxは `CAP_NET_ADMIN` + `/dev/net/tun`、OpenBSDは root + `/dev/tunN` で `ifconfig`/`route` 制御）
 - `Mode = userspace` → gVisor netstackをインプロセスで使用、権限不要
 
 ### インターフェース名の決定
@@ -202,6 +207,11 @@ SNI   = true
 設定ファイルのベース名から `.conf` を取り除いたものがインターフェース名になります:
 - `ws0.conf` → `ws0`
 - `/etc/ripws/tunnel1.conf` → `tunnel1`
+
+OpenBSD ではカーネル TUN 名が `tunN`（`tun0`, `tun1`, ...）に制約されます。
+ファイル名が `tunN` なら `/dev/tunN` を直接開き、それ以外（例: `ws0`）なら空き
+`/dev/tun0..tun31` を自動確保して `description ripws:<name>` を付与しつつ、
+PID ファイルへ実インターフェース名も保存して `ripws down` で片付けられるようにします。
 
 ---
 
@@ -656,7 +666,8 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 
 ```
 main.go                      up/down/genkey/genuuid ディスパッチ
-flake.nix                    buildGoModule（静的バイナリ）、nixosModules、checks
+proc_{linux,openbsd}.go      PID プロセス名確認 (/proc / ps)
+flake.nix                    buildGoModule（Linux + OpenBSD）、nixosModules、checks
 nix/                         module.nix（NixOS）、package.nix、eval-test.nix、vm-test.nix
 internal/
   config/                    認証情報、PSKバリデーション (SPEC 2.2)
@@ -664,9 +675,14 @@ internal/
   proto/                     IPバージョンニブル、キープアライブ、指数バックオフ
   tunnel/
     tunnel.go                Interface 抽象契約
-    tun_linux.go             kernel TUN バックエンド (songgao/water)
+    tun_linux.go             Linux kernel TUN バックエンド (songgao/water)
+    tun_openbsd.go           OpenBSD kernel TUN バックエンド (/dev/tunN + 4B AFヘッダ)
+    tun_pi.go                OpenBSD 4バイトAFヘッダ / tunNユニット名パーサ
     netstack.go              gVisor userspace バックエンド (netstack)
-    setup_linux.go           wg-quick風 ifup/ifdown (addr/MTU/routes/DNS/hooks)
+    setup.go                 共通 wg-quick風 ifup/ifdown オーケストレーション・DNS
+    setup_linux.go           Linux インターフェース/ルート設定 (ip)
+    setup_openbsd.go         OpenBSD インターフェース/ルート設定 (ifconfig + route)
+    setup_openbsd_helpers.go OpenBSD CIDR/ルート表純粋ヘルパー
     nat.go                   userspace NATゲートウェイ (gVisor Forwarder → net.Dial)
     split.go                 split-dataplane: [ProxyRule] 遮断 + fan-in
     rules.go                 ProxyRule バリデーション + 最長プレフィックス一致
@@ -684,7 +700,7 @@ Dockerfile, docker-compose*.yml
 ## 依存ライブラリ
 
 - `github.com/gorilla/websocket` — WebSocket（`http.Hijacker`アクセスでSilent Dropが自然に実装可能）
-- `github.com/songgao/water` — Linux TUN
+- `github.com/songgao/water` — Linux TUN（OpenBSDは `/dev/tunN` を直接利用）
 - `gvisor.dev/gvisor` — userspace netstack（ピン留め、`go.mod` + Nix vendor hash）
 - `github.com/google/uuid` — UUIDv4生成・検証
 

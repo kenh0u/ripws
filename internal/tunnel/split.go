@@ -1,5 +1,3 @@
-//go:build linux
-
 // Split-Dataplane: route selected destination CIDRs through an in-process
 // gVisor netstack that carries them to an upstream HTTP CONNECT / SOCKS5
 // proxy, while everything else keeps flowing through the primary (kernel

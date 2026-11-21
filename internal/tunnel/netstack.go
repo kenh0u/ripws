@@ -1,5 +1,3 @@
-//go:build linux
-
 // Package tunnel - userspace netstack backend backed by gVisor.
 //
 // This backend runs a full L3 stack in user space: no /dev/net/tun and no

@@ -58,8 +58,10 @@ A minimal, Tailscale-inspired implementation of the RIPWS protocol (see
 ### Nix flake (recommended)
 
 ```sh
-nix build .#ripws          # -> result/bin/ripws (static Go binary, CGO disabled)
-nix develop                # shell with go / gopls for hacking
+nix build .#ripws                # -> result/bin/ripws (static Go binary, CGO disabled)
+nix build .#ripws-openbsd-amd64  # -> result/bin/ripws (OpenBSD x86_64 binary)
+nix build .#ripws-openbsd-arm64  # -> result/bin/ripws (OpenBSD arm64 binary)
+nix develop                      # shell with go / gopls for hacking
 ```
 
 `flake.nix` uses `buildGoModule`; the gVisor/netstack version is pinned in
@@ -72,6 +74,9 @@ nix develop                # shell with go / gopls for hacking
 
 ```sh
 CGO_ENABLED=0 go build -o ripws .
+# Cross-compile for OpenBSD (no C cross-compiler required):
+CGO_ENABLED=0 GOOS=openbsd GOARCH=amd64 go build -o ripws-openbsd-amd64 .
+CGO_ENABLED=0 GOOS=openbsd GOARCH=arm64 go build -o ripws-openbsd-arm64 .
 ```
 
 ---
@@ -220,7 +225,7 @@ on ties). Notes:
 
 ### Kernel vs Userspace Mode
 
-- `Mode = kernel` (default) → uses host TUN device, requires `CAP_NET_ADMIN` + `/dev/net/tun`
+- `Mode = kernel` (default) → uses host TUN device (`/dev/net/tun` on Linux with `CAP_NET_ADMIN`; `/dev/tunN` on OpenBSD as root, configuring via `ifconfig`/`route`)
 - `Mode = userspace` → uses in-process gVisor netstack, no privileges needed
 
 ### Interface Name Derivation
@@ -228,6 +233,11 @@ on ties). Notes:
 The interface name is derived from the config file's basename minus `.conf`:
 - `ws0.conf` → `ws0`
 - `/etc/ripws/tunnel1.conf` → `tunnel1`
+
+On OpenBSD, kernel TUN interfaces must be named `tunN` (`tun0`, `tun1`, ...).
+If the config basename is already `tunN`, `/dev/tunN` is opened directly;
+otherwise the first free `/dev/tun0..tun31` is allocated, tagged with
+`description ripws:<name>`, and recorded in the PID file for `ripws down`.
 
 ---
 
@@ -726,7 +736,8 @@ sudo docker exec ripws-client curl -i --max-time 5 \
 
 ```
 main.go                      up/down/genkey/genuuid dispatch
-flake.nix                    buildGoModule (static binary), nixosModules, checks
+proc_{linux,openbsd}.go      PID verification (/proc vs ps)
+flake.nix                    buildGoModule (Linux + OpenBSD), nixosModules, checks
 nix/                         module.nix (NixOS), package.nix, eval-test.nix, vm-test.nix
 internal/
   config/                    credentials, PSK validation (SPEC 2.2)
@@ -734,9 +745,14 @@ internal/
   proto/                     IP-version nibble, keep-alive, exponential backoff
   tunnel/
     tunnel.go                Interface abstract contract
-    tun_linux.go             kernel TUN backend (songgao/water)
+    tun_linux.go             Linux kernel TUN backend (songgao/water)
+    tun_openbsd.go           OpenBSD kernel TUN backend (/dev/tunN + 4-byte AF framing)
+    tun_pi.go                OpenBSD 4-byte AF header & tunN unit parser
     netstack.go              gVisor userspace backend (netstack)
-    setup_linux.go           wg-quick-style ifup/ifdown (addr/MTU/routes/DNS/hooks)
+    setup.go                 shared wg-quick-style ifup/ifdown orchestration & DNS
+    setup_linux.go           Linux interface/route backend (ip)
+    setup_openbsd.go         OpenBSD interface/route backend (ifconfig + route)
+    setup_openbsd_helpers.go OpenBSD CIDR/route-table pure helpers
     nat.go                   userspace NAT gateway (gVisor Forwarder → net.Dial)
     split.go                 split-dataplane: [ProxyRule] interception + fan-in
     rules.go                 ProxyRule validation + longest-prefix matcher
@@ -755,7 +771,7 @@ Dockerfile, docker-compose*.yml
 
 - `github.com/gorilla/websocket` — WebSocket (`http.Hijacker` access makes
   Silent Drop natural to implement).
-- `github.com/songgao/water` — Linux TUN.
+- `github.com/songgao/water` — Linux TUN (`openbsd` uses `/dev/tunN` directly).
 - `gvisor.dev/gvisor` — userspace netstack (pinned; `go.mod` + Nix vendor hash).
 - `github.com/google/uuid` — UUIDv4 generation and validation.
 

@@ -3,8 +3,9 @@
 // Two modes of operation:
 //
 //   - kernel mode (wg-quick-respect): creates a host TUN device, configures
-//     addresses/routes/MTU/DNS via `ip` commands, and bridges it to the
-//     WebSocket.  Requires CAP_NET_ADMIN and /dev/net/tun.
+//     addresses/routes/MTU/DNS via OS tools (`ip` on Linux, `ifconfig`/`route`
+//     on OpenBSD), and bridges it to the WebSocket.  Requires CAP_NET_ADMIN
+//     and /dev/net/tun (Linux) or root and /dev/tunN (OpenBSD).
 //
 //   - userspace mode (Tailscale-respect): runs a full L3 stack in user space
 //     via gVisor netstack — no TUN device, no CAP_NET_ADMIN.  Optionally
@@ -27,9 +28,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -108,7 +109,7 @@ up / down:
               longest-prefix match wins; UDP to matched CIDRs is refused;
               non-TLS or SNI-less flows fall back to CONNECT <dstIP>:<port>
 
-  kernel mode requires CAP_NET_ADMIN + /dev/net/tun.
+  kernel mode requires CAP_NET_ADMIN + /dev/net/tun (Linux) or root + /dev/tunN (OpenBSD).
   userspace mode requires no privileges.
 
   Example server (ws0.conf):
@@ -172,7 +173,7 @@ func cmdUp(args []string) {
 	// Write PID file so `ripws down` can find us.
 	pidPath := pidFilePath(ifName)
 	_ = os.MkdirAll(filepath.Dir(pidPath), 0755)
-	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+	if err := writePIDFile(pidPath, os.Getpid(), ""); err != nil {
 		log.Printf("up: warning: cannot write PID file %s: %v", pidPath, err)
 	}
 	defer os.Remove(pidPath)
@@ -187,7 +188,7 @@ func cmdUp(args []string) {
 	if cfg.IsUserspace() {
 		must(runUpUserspace(ctx, cfg, creds, ifName, proxyRules))
 	} else {
-		runUpKernel(ctx, cfg, creds, ifName, proxyRules)
+		runUpKernel(ctx, cfg, creds, ifName, pidPath, proxyRules)
 	}
 }
 
@@ -236,25 +237,30 @@ func wrapSplit(tun tunnel.Interface, cfg *config.QuickConfig, rules []*tunnel.Pr
 }
 
 // runUpKernel brings up a kernel-mode tunnel (TUN + wg-quick-style config).
-func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName string, proxyRules []*tunnel.ProxyRule) {
+func runUpKernel(ctx context.Context, cfg *config.QuickConfig, creds *config.Credentials, ifName, pidPath string, proxyRules []*tunnel.ProxyRule) {
 	tun, err := tunnel.NewKernel(ifName)
 	must(err)
 	defer tun.Close()
 
+	// Record the actual kernel interface name (which on OpenBSD is tunN even
+	// when the config file is named e.g. ws0.conf).
+	_ = writePIDFile(pidPath, os.Getpid(), tun.Name())
+
 	log.Printf("up: created interface %s", tun.Name())
 
 	setup := &tunnel.InterfaceSetup{
-		Name:     tun.Name(),
-		Address:  cfg.Interface.Address,
-		MTU:      cfg.Interface.MTU,
-		Routes:   cfg.AllAllowedIPs(),
-		DNS:      cfg.Interface.DNS,
-		Table:    cfg.Interface.Table,
-		Endpoint: endpointHost(cfg),
-		PreUp:    cfg.Interface.PreUp,
-		PostUp:   cfg.Interface.PostUp,
-		PreDown:  cfg.Interface.PreDown,
-		PostDown: cfg.Interface.PostDown,
+		Name:        tun.Name(),
+		Description: ifName,
+		Address:     cfg.Interface.Address,
+		MTU:         cfg.Interface.MTU,
+		Routes:      cfg.AllAllowedIPs(),
+		DNS:         cfg.Interface.DNS,
+		Table:       cfg.Interface.Table,
+		Endpoint:    endpointHost(cfg),
+		PreUp:       cfg.Interface.PreUp,
+		PostUp:      cfg.Interface.PostUp,
+		PreDown:     cfg.Interface.PreDown,
+		PostDown:    cfg.Interface.PostDown,
 	}
 	must(setup.Up())
 	log.Printf("up: interface %s configured (addr=%v mtu=%d routes=%v)",
@@ -435,15 +441,18 @@ func cmdDown(args []string) {
 	pidPath := pidFilePath(ifName)
 
 	// 1. Try to stop a running `ripws up` process via SIGTERM.
+	kernelIfName := ifName
 	if data, err := os.ReadFile(pidPath); err == nil {
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
+		pid, recordedIf := parsePIDFile(data)
+		if recordedIf != "" {
+			kernelIfName = recordedIf
+		}
 		if pid > 0 {
-			if comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil && strings.TrimSpace(string(comm)) == "ripws" {
+			if isRIPWSProcess(pid) {
 				proc, err := os.FindProcess(pid)
 				if err == nil {
 					if err := proc.Signal(syscall.SIGTERM); err == nil {
-						log.Printf("down: sent SIGTERM to pid %d (%s)", pid, ifName)
+						log.Printf("down: sent SIGTERM to pid %d (%s)", pid, kernelIfName)
 						// Wait for the process to exit.
 						for i := 0; i < 50; i++ {
 							if proc.Signal(syscall.Signal(0)) != nil {
@@ -463,9 +472,9 @@ func cmdDown(args []string) {
 	// 2. If kernel mode, clean up the interface in case the process is dead.
 	if !cfg.IsUserspace() {
 		// Check if the interface still exists.
-		if err := exec.Command("ip", "link", "show", ifName).Run(); err == nil {
+		if tunnel.InterfaceExists(kernelIfName) {
 			setup := &tunnel.InterfaceSetup{
-				Name:     ifName,
+				Name:     kernelIfName,
 				PreDown:  cfg.Interface.PreDown,
 				PostDown: cfg.Interface.PostDown,
 				DNS:      cfg.Interface.DNS,
@@ -473,10 +482,10 @@ func cmdDown(args []string) {
 			if err := setup.Down(); err != nil {
 				log.Printf("down: %v", err)
 			} else {
-				log.Printf("down: interface %s removed", ifName)
+				log.Printf("down: interface %s removed", kernelIfName)
 			}
 		} else {
-			log.Printf("down: interface %s does not exist (already clean)", ifName)
+			log.Printf("down: interface %s does not exist (already clean)", kernelIfName)
 		}
 	} else {
 		log.Printf("down: userspace mode — process stopped, nothing to clean up")
@@ -497,19 +506,49 @@ func resolveConfigPath(arg string) string {
 }
 
 // pidFilePath returns the PID file path for a given interface name. Uses
-// /run/ripws (root-owned, created 0700) when writable so an unprivileged
+// /run/ripws (Linux) or /var/run/ripws (BSD) when writable so an unprivileged
 // user cannot poison or hijack another user's PID file; falls back to
 // /tmp/ripws-<if>.pid for unprivileged runs.
 func pidFilePath(ifName string) string {
-	dir := "/run/ripws"
-	if err := os.MkdirAll(dir, 0700); err == nil {
-		if f, err := os.OpenFile(dir+"/.probe", os.O_CREATE|os.O_WRONLY, 0600); err == nil {
-			f.Close()
-			os.Remove(dir + "/.probe")
-			return filepath.Join(dir, ifName+".pid")
+	for _, base := range []string{"/run", "/var/run"} {
+		info, err := os.Stat(base)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		dir := filepath.Join(base, "ripws")
+		if err := os.MkdirAll(dir, 0700); err == nil {
+			probe := filepath.Join(dir, ".probe")
+			if f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+				f.Close()
+				os.Remove(probe)
+				return filepath.Join(dir, ifName+".pid")
+			}
 		}
 	}
 	return filepath.Join("/tmp", "ripws-"+ifName+".pid")
+}
+
+func writePIDFile(path string, pid int, ifName string) error {
+	content := fmt.Sprintf("%d\n", pid)
+	if ifName != "" {
+		content = fmt.Sprintf("%d\n%s\n", pid, ifName)
+	}
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+func parsePIDFile(data []byte) (pid int, ifName string) {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return 0, ""
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil || p <= 0 {
+		return 0, ""
+	}
+	if len(lines) >= 2 {
+		ifName = strings.TrimSpace(lines[1])
+	}
+	return p, ifName
 }
 
 func cmdGenKey(args []string) {
